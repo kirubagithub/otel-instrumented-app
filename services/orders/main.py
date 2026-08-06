@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from typing import Any, Optional
 
@@ -14,6 +16,7 @@ from opentelemetry.propagate import inject
 from opentelemetry.trace import Status, StatusCode
 from pydantic import BaseModel, Field
 
+from schema import ensure_schema
 from telemetry import setup_telemetry
 
 logger = logging.getLogger("orders-service")
@@ -28,16 +31,68 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
+ORDER_COLUMNS = [
+    "id",
+    "product_id",
+    "quantity",
+    "status",
+    "weather_temp_c",
+    "exchange_rate",
+    "stripe_payment_intent_id",
+    "stripe_request_id",
+    "external_ref",
+    "error_message",
+    "chaos_flags",
+    "created_at",
+    "updated_at",
+]
+
+
+class ChaosOptions(BaseModel):
+    """Fault injection knobs — all optional, safe defaults."""
+
+    bff_latency_ms: int = Field(0, ge=0, le=30000)
+    catalog_latency_ms: int = Field(0, ge=0, le=30000)
+    orders_latency_ms: int = Field(0, ge=0, le=30000)
+    worker_latency_ms: int = Field(0, ge=0, le=30000)
+    queue_lag_ms: int = Field(0, ge=0, le=60000)
+    slow_close_ms: int = Field(0, ge=0, le=30000)
+    fail_open_meteo: bool = False
+    fail_stripe: bool = False
+    fail_jsonplaceholder: bool = False
+    fail_catalog: bool = False
+    fail_publish: bool = False
+
 
 class CreateOrderRequest(BaseModel):
     product_id: int
     quantity: int = Field(ge=1, le=100)
     latitude: float = 40.71
     longitude: float = -74.01
+    chaos: ChaosOptions = Field(default_factory=ChaosOptions)
 
 
 def get_conn():
     return psycopg.connect(DATABASE_URL)
+
+
+def row_to_order(row) -> dict[str, Any]:
+    out = {}
+    for k, v in zip(ORDER_COLUMNS, row):
+        if hasattr(v, "isoformat") or isinstance(v, uuid.UUID):
+            out[k] = str(v)
+        else:
+            out[k] = v
+    return out
+
+
+async def apply_delay(ms: int, name: str) -> None:
+    if ms <= 0:
+        return
+    with tracer.start_as_current_span(f"chaos.delay.{name}") as span:
+        span.set_attribute("chaos.latency_ms", ms)
+        span.set_attribute("chaos.layer", name)
+        await asyncio.sleep(ms / 1000.0)
 
 
 def publish_order_created(payload: dict[str, Any]) -> None:
@@ -46,8 +101,10 @@ def publish_order_created(payload: dict[str, Any]) -> None:
         span.set_attribute("messaging.destination.name", "orders.created")
         span.set_attribute("order.id", payload.get("id", ""))
 
-        headers: dict[str, str] = {}
+        headers: dict[str, Any] = {}
         inject(headers)
+        # RabbitMQ requires AMQP-native header values (strings)
+        amqp_headers = {str(k): str(v) for k, v in headers.items() if v is not None}
 
         params = pika.URLParameters(RABBITMQ_URL)
         connection = pika.BlockingConnection(params)
@@ -60,16 +117,23 @@ def publish_order_created(payload: dict[str, Any]) -> None:
             properties=pika.BasicProperties(
                 delivery_mode=2,
                 content_type="application/json",
-                headers=headers,
+                headers=amqp_headers,
             ),
         )
         connection.close()
 
 
-async def fetch_product(product_id: int) -> dict[str, Any]:
+async def fetch_product(product_id: int, chaos: ChaosOptions) -> dict[str, Any]:
+    await apply_delay(chaos.catalog_latency_ms, "catalog")
+    if chaos.fail_catalog:
+        with tracer.start_as_current_span("orders.call_catalog") as span:
+            span.set_attribute("chaos.fail_catalog", True)
+            span.set_status(Status(StatusCode.ERROR, "chaos fail_catalog"))
+            raise HTTPException(status_code=503, detail="chaos_catalog_failure")
+
     headers: dict[str, str] = {}
     inject(headers)
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(f"{CATALOG_URL}/products/{product_id}", headers=headers)
         if resp.status_code == 404:
             raise HTTPException(status_code=404, detail="product_not_found")
@@ -77,13 +141,20 @@ async def fetch_product(product_id: int) -> dict[str, Any]:
         return resp.json()
 
 
-async def fetch_weather(lat: float, lon: float) -> Optional[float]:
+async def fetch_weather(lat: float, lon: float, chaos: ChaosOptions) -> Optional[float]:
     """Call Open-Meteo — creates an HTTP CLIENT span to a third-party API."""
     with tracer.start_as_current_span("orders.call_open_meteo") as span:
         span.set_attribute("peer.service", "open-meteo")
         span.set_attribute("dependency.type", "third_party")
         span.set_attribute("geo.lat", lat)
         span.set_attribute("geo.lon", lon)
+        if chaos.fail_open_meteo:
+            span.set_attribute("chaos.fail_open_meteo", True)
+            span.set_status(Status(StatusCode.ERROR, "chaos fail_open_meteo"))
+            span.add_event("third_party.error", {"reason": "injected_failure"})
+            logger.warning("chaos: simulating open-meteo failure")
+            return None
+
         url = (
             "https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}&current=temperature_2m"
@@ -105,8 +176,9 @@ async def fetch_weather(lat: float, lon: float) -> Optional[float]:
             return None
 
 
-async def create_stripe_intent(amount_cents: int, currency: str, order_id: str) -> tuple[Optional[str], Optional[str]]:
-    """Optional Stripe PaymentIntent — CLIENT-side third-party span enrichment."""
+async def create_stripe_intent(
+    amount_cents: int, currency: str, order_id: str, chaos: ChaosOptions
+) -> tuple[Optional[str], Optional[str]]:
     if not STRIPE_SECRET_KEY:
         return None, None
 
@@ -116,6 +188,12 @@ async def create_stripe_intent(amount_cents: int, currency: str, order_id: str) 
         span.set_attribute("order.id", order_id)
         span.set_attribute("payment.amount_cents", amount_cents)
         span.set_attribute("payment.currency", currency)
+
+        if chaos.fail_stripe:
+            span.set_attribute("chaos.fail_stripe", True)
+            span.set_status(Status(StatusCode.ERROR, "chaos fail_stripe"))
+            raise HTTPException(status_code=502, detail="chaos_stripe_failure")
+
         try:
             intent = stripe.PaymentIntent.create(
                 amount=amount_cents,
@@ -136,9 +214,44 @@ async def create_stripe_intent(amount_cents: int, currency: str, order_id: str) 
             raise HTTPException(status_code=502, detail=f"stripe_error: {exc}") from exc
 
 
+@app.on_event("startup")
+def on_startup():
+    ensure_schema(DATABASE_URL)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "orders-service"}
+
+
+@app.get("/orders")
+def list_orders(limit: int = 50):
+    limit = max(1, min(limit, 200))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {", ".join(ORDER_COLUMNS)}
+                FROM orders
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return [row_to_order(row) for row in cur.fetchall()]
+
+
+@app.delete("/orders")
+def clear_orders():
+    with tracer.start_as_current_span("orders.clear_all") as span:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM orders")
+                deleted = cur.rowcount
+            conn.commit()
+        span.set_attribute("orders.deleted", deleted)
+        logger.info("cleared %s orders", deleted)
+        return {"deleted": deleted}
 
 
 @app.get("/orders/{order_id}")
@@ -146,9 +259,8 @@ def get_order(order_id: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT id, product_id, quantity, status, weather_temp_c, exchange_rate,
-                       stripe_payment_intent_id, stripe_request_id, external_ref, created_at, updated_at
+                f"""
+                SELECT {", ".join(ORDER_COLUMNS)}
                 FROM orders WHERE id = %s
                 """,
                 (order_id,),
@@ -156,46 +268,56 @@ def get_order(order_id: str):
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="order_not_found")
-            keys = [
-                "id",
-                "product_id",
-                "quantity",
-                "status",
-                "weather_temp_c",
-                "exchange_rate",
-                "stripe_payment_intent_id",
-                "stripe_request_id",
-                "external_ref",
-                "created_at",
-                "updated_at",
-            ]
-            return {k: (str(v) if hasattr(v, "isoformat") or isinstance(v, uuid.UUID) else v) for k, v in zip(keys, row)}
+            return row_to_order(row)
 
 
 @app.post("/orders")
 async def create_order(body: CreateOrderRequest):
+    chaos = body.chaos or ChaosOptions()
+    started = time.perf_counter()
+
     with tracer.start_as_current_span("orders.create_order") as span:
         span.set_attribute("order.product_id", body.product_id)
         span.set_attribute("order.quantity", body.quantity)
+        span.set_attribute("chaos.enabled", any(
+            [
+                chaos.orders_latency_ms,
+                chaos.queue_lag_ms,
+                chaos.slow_close_ms,
+                chaos.fail_open_meteo,
+                chaos.fail_stripe,
+                chaos.fail_jsonplaceholder,
+                chaos.fail_catalog,
+                chaos.fail_publish,
+                chaos.worker_latency_ms,
+                chaos.catalog_latency_ms,
+                chaos.bff_latency_ms,
+            ]
+        ))
 
-        product = await fetch_product(body.product_id)
+        await apply_delay(chaos.orders_latency_ms, "orders")
+
+        product = await fetch_product(body.product_id, chaos)
         amount_cents = int(product["price_cents"]) * body.quantity
         currency = product.get("currency", "usd")
         order_id = str(uuid.uuid4())
         span.set_attribute("order.id", order_id)
         span.set_attribute("order.amount_cents", amount_cents)
 
-        weather_temp = await fetch_weather(body.latitude, body.longitude)
-        stripe_pi, stripe_req = await create_stripe_intent(amount_cents, currency, order_id)
+        weather_temp = await fetch_weather(body.latitude, body.longitude, chaos)
+        stripe_pi, stripe_req = await create_stripe_intent(
+            amount_cents, currency, order_id, chaos
+        )
 
+        chaos_payload = chaos.model_dump()
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO orders (
                       id, product_id, quantity, status, weather_temp_c,
-                      stripe_payment_intent_id, stripe_request_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                      stripe_payment_intent_id, stripe_request_id, chaos_flags
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     """,
                     (
                         order_id,
@@ -205,6 +327,7 @@ async def create_order(body: CreateOrderRequest):
                         weather_temp,
                         stripe_pi,
                         stripe_req,
+                        json.dumps(chaos_payload),
                     ),
                 )
             conn.commit()
@@ -217,22 +340,52 @@ async def create_order(body: CreateOrderRequest):
             "currency": currency,
             "weather_temp_c": weather_temp,
             "stripe_payment_intent_id": stripe_pi,
+            "chaos": chaos_payload,
         }
-        publish_order_created(payload)
-        logger.info("order created id=%s product_id=%s", order_id, body.product_id)
+
+        if chaos.fail_publish:
+            with tracer.start_as_current_span("orders.publish_order_created") as pub_span:
+                pub_span.set_attribute("chaos.fail_publish", True)
+                pub_span.set_status(Status(StatusCode.ERROR, "chaos fail_publish"))
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE orders
+                        SET status = 'failed',
+                            error_message = 'chaos_publish_failure',
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (order_id,),
+                    )
+                conn.commit()
+        else:
+            publish_order_created(payload)
+
+        await apply_delay(chaos.slow_close_ms, "slow_close")
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        span.set_attribute("http.server.duration_ms", elapsed_ms)
+        logger.info("order created id=%s product_id=%s elapsed_ms=%s", order_id, body.product_id, elapsed_ms)
 
         return {
             "id": order_id,
             "product_id": body.product_id,
             "quantity": body.quantity,
-            "status": "pending",
+            "status": "failed" if chaos.fail_publish else "pending",
             "amount_cents": amount_cents,
             "currency": currency,
             "weather_temp_c": weather_temp,
             "stripe_payment_intent_id": stripe_pi,
             "stripe_request_id": stripe_req,
+            "error_message": "chaos_publish_failure" if chaos.fail_publish else None,
+            "chaos": chaos_payload,
             "peer_calls": {
-                "open_meteo": "always",
-                "stripe": "enabled" if STRIPE_SECRET_KEY else "skipped",
+                "open_meteo": "failed" if chaos.fail_open_meteo else "always",
+                "stripe": (
+                    "failed"
+                    if chaos.fail_stripe
+                    else ("enabled" if STRIPE_SECRET_KEY else "skipped")
+                ),
             },
         }

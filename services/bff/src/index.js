@@ -12,6 +12,10 @@ const tracer = trace.getTracer('bff-service');
 app.use(cors());
 app.use(express.json());
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function forwardJson(method, url, body) {
   const headers = { 'content-type': 'application/json', accept: 'application/json' };
   propagation.inject(context.active(), headers);
@@ -52,9 +56,53 @@ app.get('/api/products', async (_req, res) => {
   }
 });
 
+app.get('/api/orders', async (req, res) => {
+  const span = tracer.startSpan('bff.list_orders');
+  try {
+    const limit = req.query.limit || 50;
+    const { statusCode, data } = await context.with(trace.setSpan(context.active(), span), () =>
+      forwardJson('GET', `${ordersUrl}/orders?limit=${encodeURIComponent(limit)}`)
+    );
+    res.status(statusCode).json(data);
+  } catch (err) {
+    span.recordException(err);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+    res.status(502).json({ error: 'orders_unavailable', detail: err.message });
+  } finally {
+    span.end();
+  }
+});
+
+app.delete('/api/orders', async (_req, res) => {
+  const span = tracer.startSpan('bff.clear_orders');
+  try {
+    const { statusCode, data } = await context.with(trace.setSpan(context.active(), span), () =>
+      forwardJson('DELETE', `${ordersUrl}/orders`)
+    );
+    if (data?.deleted != null) span.setAttribute('orders.deleted', data.deleted);
+    res.status(statusCode).json(data);
+  } catch (err) {
+    span.recordException(err);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+    res.status(502).json({ error: 'orders_unavailable', detail: err.message });
+  } finally {
+    span.end();
+  }
+});
+
 app.post('/api/orders', async (req, res) => {
   const span = tracer.startSpan('bff.create_order');
   try {
+    const chaos = req.body?.chaos || {};
+    const bffLatency = Number(chaos.bff_latency_ms || 0);
+    if (bffLatency > 0) {
+      const delaySpan = tracer.startSpan('chaos.delay.bff');
+      delaySpan.setAttribute('chaos.latency_ms', bffLatency);
+      delaySpan.setAttribute('chaos.layer', 'bff');
+      await sleep(bffLatency);
+      delaySpan.end();
+    }
+
     span.setAttribute('order.product_id', req.body?.product_id ?? '');
     span.setAttribute('order.quantity', req.body?.quantity ?? 0);
     const { statusCode, data } = await context.with(trace.setSpan(context.active(), span), () =>

@@ -1,0 +1,83 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "http://localhost:5173"
+            - "http://127.0.0.1:5173"
+            - "http://localhost:3000"
+            - "http://127.0.0.1:3000"
+            - "*"
+
+processors:
+  memory_limiter:
+    check_interval: 2s
+    limit_mib: 400
+    spike_limit_mib: 100
+
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: demo
+        action: upsert
+      - key: lab.stack
+        value: otel-microservices
+        action: upsert
+
+  transform/peer_service:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["peer.service"], "stripe") where IsMatch(attributes["server.address"], "(?i).*stripe\\.com.*") or IsMatch(attributes["url.full"], "(?i).*stripe\\.com.*") or IsMatch(attributes["http.url"], "(?i).*stripe\\.com.*")
+          - set(attributes["peer.service"], "open-meteo") where IsMatch(attributes["server.address"], "(?i).*open-meteo\\.com.*") or IsMatch(attributes["url.full"], "(?i).*open-meteo\\.com.*") or IsMatch(attributes["http.url"], "(?i).*open-meteo\\.com.*")
+          - set(attributes["peer.service"], "jsonplaceholder") where IsMatch(attributes["server.address"], "(?i).*jsonplaceholder.*") or IsMatch(attributes["url.full"], "(?i).*jsonplaceholder.*") or IsMatch(attributes["http.url"], "(?i).*jsonplaceholder.*")
+          - set(attributes["dependency.type"], "third_party") where attributes["peer.service"] != nil
+
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  otlphttp/openobserve:
+    endpoint: ${env:OPENOBSERVE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:OPENOBSERVE_AUTHORIZATION}
+      organization: ${env:OPENOBSERVE_ORG}
+      stream-name: ${env:OPENOBSERVE_STREAM}
+    compression: gzip
+    timeout: 30s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, transform/peer_service, batch]
+      exporters: [otlphttp/openobserve, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/openobserve, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/openobserve, debug]

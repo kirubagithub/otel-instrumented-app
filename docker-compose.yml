@@ -1,0 +1,151 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: otel
+      POSTGRES_PASSWORD: otel
+      POSTGRES_DB: otel_demo
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U otel -d otel_demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: otel
+      RABBITMQ_DEFAULT_PASS: otel
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    environment:
+      OPENOBSERVE_OTLP_ENDPOINT: ${OPENOBSERVE_OTLP_ENDPOINT:-https://api.openobserve.ai/api/default}
+      OPENOBSERVE_AUTHORIZATION: ${OPENOBSERVE_AUTHORIZATION:-Basic REPLACE_ME}
+      OPENOBSERVE_ORG: ${OPENOBSERVE_ORG:-default}
+      OPENOBSERVE_STREAM: ${OPENOBSERVE_STREAM:-default}
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP (browser RUM + apps)
+      - "13133:13133" # health
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:13133"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  catalog:
+    build: ./services/catalog
+    environment:
+      SERVER_PORT: "8082"
+      DATABASE_URL: jdbc:postgresql://postgres:5432/otel_demo
+      DATABASE_USER: otel
+      DATABASE_PASSWORD: otel
+      OTEL_SERVICE_NAME: catalog-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
+      OTEL_LOGS_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_TRACES_EXPORTER: otlp
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  orders:
+    build: ./services/orders
+    environment:
+      PORT: "8081"
+      DATABASE_URL: postgresql://otel:otel@postgres:5432/otel_demo
+      RABBITMQ_URL: amqp://otel:otel@rabbitmq:5672/
+      CATALOG_URL: http://catalog:8082
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      OTEL_SERVICE_NAME: orders-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
+      OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      catalog:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+
+  worker:
+    build: ./services/worker
+    environment:
+      RABBITMQ_URL: amqp://otel:otel@rabbitmq:5672/
+      DATABASE_URL: postgres://otel:otel@postgres:5432/otel_demo?sslmode=disable
+      OTEL_SERVICE_NAME: worker-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  bff:
+    build: ./services/bff
+    environment:
+      PORT: "3000"
+      ORDERS_URL: http://orders:8081
+      CATALOG_URL: http://catalog:8082
+      OTEL_SERVICE_NAME: bff-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
+      OTEL_NODE_RESOURCE_DETECTORS: env,host,os
+    ports:
+      - "3000:3000"
+    depends_on:
+      orders:
+        condition: service_started
+      catalog:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_BFF_URL: ${VITE_BFF_URL:-http://localhost:3000}
+        VITE_OTEL_EXPORTER_OTLP_ENDPOINT: ${VITE_OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}
+    ports:
+      - "5173:80"
+    depends_on:
+      - bff
+      - otel-collector
+
+volumes:
+  pgdata:

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from schema import ensure_schema
 from telemetry import setup_telemetry
+from feature_flags import init_feature_flags, resolve_chaos
 
 logger = logging.getLogger("orders-service")
 app = FastAPI(title="orders-service")
@@ -69,7 +70,8 @@ class CreateOrderRequest(BaseModel):
     quantity: int = Field(ge=1, le=100)
     latitude: float = 40.71
     longitude: float = -74.01
-    chaos: ChaosOptions = Field(default_factory=ChaosOptions)
+    # Optional one-shot overrides. Prefer OpenFeature/flagd gates for normal demos.
+    chaos: Optional[ChaosOptions] = None
 
 
 def get_conn():
@@ -217,6 +219,13 @@ async def create_stripe_intent(
 @app.on_event("startup")
 def on_startup():
     ensure_schema(DATABASE_URL)
+    init_feature_flags()
+
+
+@app.get("/chaos")
+def get_chaos_flags():
+    """Current chaos feature-gate values from OpenFeature/flagd."""
+    return {"source": "openfeature/flagd", "chaos": resolve_chaos("orders-service")}
 
 
 @app.get("/health")
@@ -273,12 +282,22 @@ def get_order(order_id: str):
 
 @app.post("/orders")
 async def create_order(body: CreateOrderRequest):
-    chaos = body.chaos or ChaosOptions()
+    # OpenFeature gates are the control plane; request.chaos is an optional override.
+    flag_chaos = resolve_chaos(targeting_key=str(body.product_id))
+    if body.chaos is not None:
+        override = body.chaos.model_dump()
+        for key, value in override.items():
+            if isinstance(value, bool):
+                flag_chaos[key] = flag_chaos.get(key, False) or value
+            elif isinstance(value, (int, float)) and value:
+                flag_chaos[key] = int(value)
+    chaos = ChaosOptions(**flag_chaos)
     started = time.perf_counter()
 
     with tracer.start_as_current_span("orders.create_order") as span:
         span.set_attribute("order.product_id", body.product_id)
         span.set_attribute("order.quantity", body.quantity)
+        span.set_attribute("feature_flag.source", "openfeature/flagd")
         span.set_attribute("chaos.enabled", any(
             [
                 chaos.orders_latency_ms,
@@ -294,6 +313,8 @@ async def create_order(body: CreateOrderRequest):
                 chaos.bff_latency_ms,
             ]
         ))
+        for key, value in chaos.model_dump().items():
+            span.set_attribute(f"chaos.{key}", value)
 
         await apply_delay(chaos.orders_latency_ms, "orders")
 
@@ -380,6 +401,7 @@ async def create_order(body: CreateOrderRequest):
             "stripe_request_id": stripe_req,
             "error_message": "chaos_publish_failure" if chaos.fail_publish else None,
             "chaos": chaos_payload,
+            "feature_flag_source": "openfeature/flagd",
             "peer_calls": {
                 "open_meteo": "failed" if chaos.fail_open_meteo else "always",
                 "stripe": (

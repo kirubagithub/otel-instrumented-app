@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { request } from 'undici';
 import { trace, context, propagation, SpanStatusCode } from '@opentelemetry/api';
+import { initFeatureFlags, resolveChaos, updateChaosFlags } from './featureFlags.js';
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -35,8 +36,40 @@ async function forwardJson(method, url, body) {
   return { statusCode: res.statusCode, data };
 }
 
+initFeatureFlags();
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'bff-service' });
+});
+
+app.get('/api/flags/chaos', async (_req, res) => {
+  const span = tracer.startSpan('bff.get_chaos_flags');
+  try {
+    const chaos = await resolveChaos('bff-admin');
+    span.setAttribute('feature_flag.source', 'openfeature/flagd');
+    res.json({ source: 'openfeature/flagd', chaos });
+  } catch (err) {
+    span.recordException(err);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+    res.status(502).json({ error: 'flagd_unavailable', detail: err.message });
+  } finally {
+    span.end();
+  }
+});
+
+app.put('/api/flags/chaos', async (req, res) => {
+  const span = tracer.startSpan('bff.update_chaos_flags');
+  try {
+    span.setAttribute('feature_flag.source', 'openfeature/flagd');
+    const chaos = await updateChaosFlags(req.body?.chaos || req.body || {});
+    res.json({ source: 'openfeature/flagd', chaos, updated: true });
+  } catch (err) {
+    span.recordException(err);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+    res.status(500).json({ error: 'flag_update_failed', detail: err.message });
+  } finally {
+    span.end();
+  }
 });
 
 app.get('/api/products', async (_req, res) => {
@@ -93,20 +126,28 @@ app.delete('/api/orders', async (_req, res) => {
 app.post('/api/orders', async (req, res) => {
   const span = tracer.startSpan('bff.create_order');
   try {
-    const chaos = req.body?.chaos || {};
-    const bffLatency = Number(chaos.bff_latency_ms || 0);
+    const flagChaos = await resolveChaos(String(req.body?.product_id || 'anonymous'));
+    const bffLatency = Number(flagChaos.bff_latency_ms || 0);
+    span.setAttribute('feature_flag.source', 'openfeature/flagd');
+    span.setAttribute('chaos.bff_latency_ms', bffLatency);
+
     if (bffLatency > 0) {
       const delaySpan = tracer.startSpan('chaos.delay.bff');
       delaySpan.setAttribute('chaos.latency_ms', bffLatency);
       delaySpan.setAttribute('chaos.layer', 'bff');
+      delaySpan.setAttribute('feature_flag.key', 'chaos.bff_latency_ms');
       await sleep(bffLatency);
       delaySpan.end();
     }
 
     span.setAttribute('order.product_id', req.body?.product_id ?? '');
     span.setAttribute('order.quantity', req.body?.quantity ?? 0);
+    // Do not require clients to send chaos; services evaluate OpenFeature themselves.
+    const body = { ...req.body };
+    delete body.chaos;
+
     const { statusCode, data } = await context.with(trace.setSpan(context.active(), span), () =>
-      forwardJson('POST', `${ordersUrl}/orders`, req.body)
+      forwardJson('POST', `${ordersUrl}/orders`, body)
     );
     span.setAttribute('http.status_code', statusCode);
     if (data?.id) span.setAttribute('order.id', data.id);

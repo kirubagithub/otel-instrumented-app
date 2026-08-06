@@ -1,3 +1,12 @@
+# OpenTelemetry Collector
+#
+# Apps and RUM always export HERE (OTLP). Swap observability backends by
+# changing exporter env vars / which exporter is enabled in pipelines —
+# no application code changes required.
+#
+# Default backend exporter: otlphttp/backend (OTLP/HTTP)
+# Alternate (commented):     otlp/backend     (OTLP/gRPC)
+
 receivers:
   otlp:
     protocols:
@@ -43,12 +52,26 @@ processors:
     send_batch_size: 512
 
 exporters:
-  otlphttp/openobserve:
-    endpoint: ${env:OPENOBSERVE_OTLP_ENDPOINT}
+  # -------------------------------------------------------------------------
+  # OTLP/HTTP — default. Works with OpenObserve, Grafana Cloud, Honeycomb,
+  # Elastic, self-hosted Tempo/OTel backends that accept OTLP/HTTP.
+  #
+  # Examples:
+  #   OpenObserve:  https://api.openobserve.ai/api/<org>
+  #                 Authorization=Basic <token>
+  #                 (optional) organization / stream-name headers below
+  #   Grafana Cloud: https://otlp-gateway-prod-xxx.grafana.net/otlp
+  #                 Authorization=Basic <instance:token>
+  #   Honeycomb:     https://api.honeycomb.io
+  #                 x-honeycomb-team=<api-key>  (add under headers)
+  # -------------------------------------------------------------------------
+  otlphttp/backend:
+    endpoint: ${env:OTEL_BACKEND_OTLP_HTTP_ENDPOINT}
     headers:
-      Authorization: ${env:OPENOBSERVE_AUTHORIZATION}
-      organization: ${env:OPENOBSERVE_ORG}
-      stream-name: ${env:OPENOBSERVE_STREAM}
+      Authorization: ${env:OTEL_BACKEND_AUTHORIZATION}
+      # OpenObserve-specific (harmless empty for most other backends if unused)
+      organization: ${env:OTEL_BACKEND_HEADER_ORGANIZATION}
+      stream-name: ${env:OTEL_BACKEND_HEADER_STREAM}
     compression: gzip
     timeout: 30s
     retry_on_failure:
@@ -57,6 +80,24 @@ exporters:
       max_interval: 30s
       max_elapsed_time: 300s
 
+  # -------------------------------------------------------------------------
+  # OTLP/gRPC — enable for backends that prefer gRPC (Tempo, Jaeger OTLP,
+  # another Collector, etc.). To use:
+  #   1) Set OTEL_BACKEND_OTLP_GRPC_ENDPOINT (host:port, no https://)
+  #   2) In pipelines below, replace otlphttp/backend with otlp/backend
+  # -------------------------------------------------------------------------
+  # otlp/backend:
+  #   endpoint: ${env:OTEL_BACKEND_OTLP_GRPC_ENDPOINT}
+  #   headers:
+  #     Authorization: ${env:OTEL_BACKEND_AUTHORIZATION}
+  #   tls:
+  #     insecure: ${env:OTEL_BACKEND_OTLP_GRPC_TLS_INSECURE}
+  #   compression: gzip
+  #   timeout: 30s
+  #   retry_on_failure:
+  #     enabled: true
+
+  # Local debug sink — always useful while wiring a new backend
   debug:
     verbosity: basic
     sampling_initial: 5
@@ -72,12 +113,13 @@ service:
     traces:
       receivers: [otlp]
       processors: [memory_limiter, resource, transform/peer_service, batch]
-      exporters: [otlphttp/openobserve, debug]
+      # Swap otlphttp/backend ↔ otlp/backend when changing transport
+      exporters: [otlphttp/backend, debug]
     logs:
       receivers: [otlp]
       processors: [memory_limiter, resource, batch]
-      exporters: [otlphttp/openobserve, debug]
+      exporters: [otlphttp/backend, debug]
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, resource, batch]
-      exporters: [otlphttp/openobserve, debug]
+      exporters: [otlphttp/backend, debug]

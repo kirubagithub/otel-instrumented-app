@@ -14,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	amqp "github.com/rabbitmq/amqp091-go"
+	flagd "github.com/open-feature/go-sdk-contrib/providers/flagd/pkg"
+	"github.com/open-feature/go-sdk/openfeature"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -34,9 +36,9 @@ import (
 )
 
 type chaosOptions struct {
-	WorkerLatencyMs      int  `json:"worker_latency_ms"`
-	QueueLagMs           int  `json:"queue_lag_ms"`
-	FailJSONPlaceholder  bool `json:"fail_jsonplaceholder"`
+	WorkerLatencyMs     int  `json:"worker_latency_ms"`
+	QueueLagMs          int  `json:"queue_lag_ms"`
+	FailJSONPlaceholder bool `json:"fail_jsonplaceholder"`
 }
 
 type orderEvent struct {
@@ -59,6 +61,10 @@ func main() {
 		log.Fatalf("otel setup: %v", err)
 	}
 	defer func() { _ = shutdown(context.Background()) }()
+
+	if err := setupFeatureFlags(ctx); err != nil {
+		log.Printf("openfeature/flagd unavailable (continuing): %v", err)
+	}
 
 	dbURL := envOr("DATABASE_URL", "postgres://otel:otel@localhost:5432/otel_demo?sslmode=disable")
 	pool, err := pgxpool.New(ctx, dbURL)
@@ -109,6 +115,60 @@ func main() {
 	}
 }
 
+func setupFeatureFlags(ctx context.Context) error {
+	host := envOr("FLAGD_HOST", "flagd")
+	port := envOr("FLAGD_PORT", "8013")
+	provider := flagd.NewProvider(
+		flagd.WithHost(host),
+		flagd.WithPort(uint16(mustAtoi(port, 8013))),
+	)
+	if err := openfeature.SetProviderAndWait(provider); err != nil {
+		return err
+	}
+	log.Printf("OpenFeature flagd provider ready at %s:%s", host, port)
+	return nil
+}
+
+func mustAtoi(s string, def int) int {
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func resolveChaosFromFlags(ctx context.Context, orderID string) chaosOptions {
+	client := openfeature.NewClient("worker-service")
+	evalCtx := openfeature.NewEvaluationContext(orderID, map[string]any{})
+	out := chaosOptions{}
+	if v, err := client.IntValue(ctx, "chaos.worker_latency_ms", 0, evalCtx); err == nil {
+		out.WorkerLatencyMs = int(v)
+	}
+	if v, err := client.IntValue(ctx, "chaos.queue_lag_ms", 0, evalCtx); err == nil {
+		out.QueueLagMs = int(v)
+	}
+	if v, err := client.BooleanValue(ctx, "chaos.fail_jsonplaceholder", false, evalCtx); err == nil {
+		out.FailJSONPlaceholder = v
+	}
+	return out
+}
+
+func mergeChaos(msg *chaosOptions, flags chaosOptions) chaosOptions {
+	out := flags
+	if msg == nil {
+		return out
+	}
+	if msg.WorkerLatencyMs > out.WorkerLatencyMs {
+		out.WorkerLatencyMs = msg.WorkerLatencyMs
+	}
+	if msg.QueueLagMs > out.QueueLagMs {
+		out.QueueLagMs = msg.QueueLagMs
+	}
+	out.FailJSONPlaceholder = out.FailJSONPlaceholder || msg.FailJSONPlaceholder
+	return out
+}
+
 func ensureColumns(ctx context.Context, pool *pgxpool.Pool) {
 	_, _ = pool.Exec(ctx, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS error_message TEXT`)
 	_, _ = pool.Exec(ctx, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS chaos_flags JSONB`)
@@ -125,6 +185,7 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 			attribute.String("messaging.system", "rabbitmq"),
 			attribute.String("messaging.destination.name", "orders.created"),
 			attribute.String("messaging.operation", "process"),
+			attribute.String("feature_flag.source", "openfeature/flagd"),
 		),
 	)
 	defer span.End()
@@ -138,17 +199,19 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 	}
 	span.SetAttributes(attribute.String("order.id", event.ID))
 
-	chaos := event.Chaos
-	if chaos == nil {
-		chaos = &chaosOptions{}
-	}
+	chaos := mergeChaos(event.Chaos, resolveChaosFromFlags(ctx, event.ID))
+	span.SetAttributes(
+		attribute.Int("chaos.worker_latency_ms", chaos.WorkerLatencyMs),
+		attribute.Int("chaos.queue_lag_ms", chaos.QueueLagMs),
+		attribute.Bool("chaos.fail_jsonplaceholder", chaos.FailJSONPlaceholder),
+	)
 
-	// Simulate broker/consumer buffer lag before work starts.
 	if chaos.QueueLagMs > 0 {
 		_, lagSpan := tracer.Start(ctx, "chaos.queue_lag")
 		lagSpan.SetAttributes(
 			attribute.Int("chaos.queue_lag_ms", chaos.QueueLagMs),
 			attribute.String("chaos.layer", "worker_queue"),
+			attribute.String("feature_flag.key", "chaos.queue_lag_ms"),
 		)
 		time.Sleep(time.Duration(chaos.QueueLagMs) * time.Millisecond)
 		lagSpan.End()
@@ -164,6 +227,7 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 		delaySpan.SetAttributes(
 			attribute.Int("chaos.latency_ms", chaos.WorkerLatencyMs),
 			attribute.String("chaos.layer", "worker"),
+			attribute.String("feature_flag.key", "chaos.worker_latency_ms"),
 		)
 		time.Sleep(time.Duration(chaos.WorkerLatencyMs) * time.Millisecond)
 		delaySpan.End()
@@ -216,7 +280,10 @@ func callJSONPlaceholder(ctx context.Context, client *http.Client, orderID strin
 
 	if failInjected {
 		err := fmt.Errorf("chaos_jsonplaceholder_failure")
-		span.SetAttributes(attribute.Bool("chaos.fail_jsonplaceholder", true))
+		span.SetAttributes(
+			attribute.Bool("chaos.fail_jsonplaceholder", true),
+			attribute.String("feature_flag.key", "chaos.fail_jsonplaceholder"),
+		)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		span.AddEvent("third_party.error")

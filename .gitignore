@@ -9,5 +9,4 @@ target/
 __pycache__/
 *.pyc
 .DS_Store
-services/worker/go.sum
 frontend/dist/

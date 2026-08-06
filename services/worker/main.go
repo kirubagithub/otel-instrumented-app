@@ -33,14 +33,21 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+type chaosOptions struct {
+	WorkerLatencyMs      int  `json:"worker_latency_ms"`
+	QueueLagMs           int  `json:"queue_lag_ms"`
+	FailJSONPlaceholder  bool `json:"fail_jsonplaceholder"`
+}
+
 type orderEvent struct {
-	ID                     string   `json:"id"`
-	ProductID              int      `json:"product_id"`
-	Quantity               int      `json:"quantity"`
-	AmountCents            int      `json:"amount_cents"`
-	Currency               string   `json:"currency"`
-	WeatherTempC           *float64 `json:"weather_temp_c"`
-	StripePaymentIntentID  *string  `json:"stripe_payment_intent_id"`
+	ID                    string        `json:"id"`
+	ProductID             int           `json:"product_id"`
+	Quantity              int           `json:"quantity"`
+	AmountCents           int           `json:"amount_cents"`
+	Currency              string        `json:"currency"`
+	WeatherTempC          *float64      `json:"weather_temp_c"`
+	StripePaymentIntentID *string       `json:"stripe_payment_intent_id"`
+	Chaos                 *chaosOptions `json:"chaos"`
 }
 
 func main() {
@@ -59,6 +66,8 @@ func main() {
 		log.Fatalf("db: %v", err)
 	}
 	defer pool.Close()
+
+	ensureColumns(ctx, pool)
 
 	rabbitURL := envOr("RABBITMQ_URL", "amqp://otel:otel@localhost:5672/")
 	conn, err := amqp.Dial(rabbitURL)
@@ -84,7 +93,7 @@ func main() {
 	}
 
 	tracer := otel.Tracer("worker-service")
-	client := &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport), Timeout: 10 * time.Second}
+	client := &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport), Timeout: 15 * time.Second}
 
 	log.Println("worker-service consuming orders.created")
 	for {
@@ -98,6 +107,11 @@ func main() {
 			processDelivery(ctx, tracer, client, pool, d)
 		}
 	}
+}
+
+func ensureColumns(ctx context.Context, pool *pgxpool.Pool) {
+	_, _ = pool.Exec(ctx, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS error_message TEXT`)
+	_, _ = pool.Exec(ctx, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS chaos_flags JSONB`)
 }
 
 func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Client, pool *pgxpool.Pool, d amqp.Delivery) {
@@ -124,16 +138,57 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 	}
 	span.SetAttributes(attribute.String("order.id", event.ID))
 
-	ref, err := callJSONPlaceholder(ctx, client, event.ID)
+	chaos := event.Chaos
+	if chaos == nil {
+		chaos = &chaosOptions{}
+	}
+
+	// Simulate broker/consumer buffer lag before work starts.
+	if chaos.QueueLagMs > 0 {
+		_, lagSpan := tracer.Start(ctx, "chaos.queue_lag")
+		lagSpan.SetAttributes(
+			attribute.Int("chaos.queue_lag_ms", chaos.QueueLagMs),
+			attribute.String("chaos.layer", "worker_queue"),
+		)
+		time.Sleep(time.Duration(chaos.QueueLagMs) * time.Millisecond)
+		lagSpan.End()
+	}
+
+	_, _ = pool.Exec(ctx,
+		`UPDATE orders SET status = 'processing', updated_at = NOW() WHERE id = $1`,
+		event.ID,
+	)
+
+	if chaos.WorkerLatencyMs > 0 {
+		_, delaySpan := tracer.Start(ctx, "chaos.delay.worker")
+		delaySpan.SetAttributes(
+			attribute.Int("chaos.latency_ms", chaos.WorkerLatencyMs),
+			attribute.String("chaos.layer", "worker"),
+		)
+		time.Sleep(time.Duration(chaos.WorkerLatencyMs) * time.Millisecond)
+		delaySpan.End()
+	}
+
+	ref, err := callJSONPlaceholder(ctx, client, event.ID, chaos.FailJSONPlaceholder)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
-		_ = d.Nack(false, true)
+		_, dbErr := pool.Exec(ctx,
+			`UPDATE orders SET status = 'failed', error_message = $2, updated_at = NOW() WHERE id = $1`,
+			event.ID, err.Error(),
+		)
+		if dbErr != nil {
+			log.Printf("failed to mark order %s failed: %v", event.ID, dbErr)
+			_ = d.Nack(false, true)
+			return
+		}
+		_ = d.Ack(false)
+		log.Printf("order %s failed: %v", event.ID, err)
 		return
 	}
 
 	_, err = pool.Exec(ctx,
-		`UPDATE orders SET status = 'processed', external_ref = $2, updated_at = NOW() WHERE id = $1`,
+		`UPDATE orders SET status = 'processed', external_ref = $2, error_message = NULL, updated_at = NOW() WHERE id = $1`,
 		event.ID, ref,
 	)
 	if err != nil {
@@ -148,7 +203,7 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 	log.Printf("processed order %s ref=%s", event.ID, ref)
 }
 
-func callJSONPlaceholder(ctx context.Context, client *http.Client, orderID string) (string, error) {
+func callJSONPlaceholder(ctx context.Context, client *http.Client, orderID string, failInjected bool) (string, error) {
 	ctx, span := otel.Tracer("worker-service").Start(ctx, "worker.call_jsonplaceholder",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(
@@ -158,6 +213,15 @@ func callJSONPlaceholder(ctx context.Context, client *http.Client, orderID strin
 		),
 	)
 	defer span.End()
+
+	if failInjected {
+		err := fmt.Errorf("chaos_jsonplaceholder_failure")
+		span.SetAttributes(attribute.Bool("chaos.fail_jsonplaceholder", true))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.AddEvent("third_party.error")
+		return "", err
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://jsonplaceholder.typicode.com/posts/1", nil)
 	if err != nil {
@@ -267,16 +331,17 @@ func stripScheme(endpoint string) string {
 	return endpoint
 }
 
-type amqpHeaders map[string]any
-
 func amqpHeaderCarrier(h amqp.Table) propagation.TextMapCarrier {
 	out := propagation.MapCarrier{}
 	if h == nil {
 		return out
 	}
 	for k, v := range h {
-		if s, ok := v.(string); ok {
-			out[k] = s
+		switch t := v.(type) {
+		case string:
+			out[k] = t
+		case []byte:
+			out[k] = string(t)
 		}
 	}
 	return out

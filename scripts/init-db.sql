@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS orders (
   stripe_payment_intent_id TEXT,
   stripe_request_id TEXT,
   external_ref TEXT,
+  error_message TEXT,
+  chaos_flags JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

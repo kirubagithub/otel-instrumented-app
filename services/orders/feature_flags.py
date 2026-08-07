@@ -35,6 +35,13 @@ _BOOL_FLAGS = {
 _initialized = False
 
 
+def _default_chaos() -> dict[str, Any]:
+    return {
+        key.replace("chaos.", "", 1): (False if key in _BOOL_FLAGS else 0)
+        for key in _FLAG_KEYS
+    }
+
+
 def init_feature_flags() -> None:
     global _initialized
     if _initialized:
@@ -52,23 +59,27 @@ def init_feature_flags() -> None:
 
 
 def _client():
-    return api.get_client(name="orders-service")
+    # openfeature-sdk 0.8.x uses domain=, not name=
+    return api.get_client(domain="orders-service")
 
 
 def resolve_chaos(targeting_key: str | None = None) -> dict[str, Any]:
     """Evaluate chaos feature gates from flagd (outside control plane)."""
-    init_feature_flags()
-    ctx = EvaluationContext(targeting_key=targeting_key or "anonymous")
-    client = _client()
-    out: dict[str, Any] = {}
-    for key in _FLAG_KEYS:
-        short = key.replace("chaos.", "", 1)
-        try:
-            if key in _BOOL_FLAGS:
-                out[short] = bool(client.get_boolean_value(key, False, ctx))
-            else:
-                out[short] = int(client.get_integer_value(key, 0, ctx))
-        except Exception as exc:
-            logger.warning("flag eval failed for %s: %s", key, exc)
-            out[short] = False if key in _BOOL_FLAGS else 0
+    out = _default_chaos()
+    try:
+        init_feature_flags()
+        ctx = EvaluationContext(targeting_key=targeting_key or "anonymous")
+        client = _client()
+        for key in _FLAG_KEYS:
+            short = key.replace("chaos.", "", 1)
+            try:
+                if key in _BOOL_FLAGS:
+                    out[short] = bool(client.get_boolean_value(key, False, ctx))
+                else:
+                    out[short] = int(client.get_integer_value(key, 0, ctx))
+            except Exception as exc:
+                logger.warning("flag eval failed for %s: %s", key, exc)
+    except Exception as exc:
+        # Never fail checkout because of feature-flag plumbing
+        logger.warning("resolve_chaos failed; using safe defaults: %s", exc)
     return out

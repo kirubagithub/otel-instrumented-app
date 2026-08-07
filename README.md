@@ -1,42 +1,6 @@
 # OTel Microservices Lab
 
-Docker Compose demo of a polyglot microservice stack instrumented with **OpenTelemetry** (RUM, traces, logs, metrics).
-
-## Design: pluggable backends (recommended)
-
-**Apps never talk to OpenObserve / Grafana / Honeycomb directly.**
-
-```
-Browser + services  ──OTLP──►  OpenTelemetry Collector  ──OTLP/HTTP or OTLP/gRPC──►  your backend
-```
-
-To switch backends later, change **Collector env / config only** — not application code.
-
-| Env var | Purpose |
-|---------|---------|
-| `OTEL_BACKEND_OTLP_HTTP_ENDPOINT` | Default exporter endpoint (OpenObserve today) |
-| `OTEL_BACKEND_AUTHORIZATION` | `Authorization` header |
-| `OTEL_BACKEND_HEADER_ORGANIZATION` | Optional (OpenObserve) |
-| `OTEL_BACKEND_HEADER_STREAM` | Optional (OpenObserve) |
-
-In `otel-collector/config.yaml`:
-- **Active:** `otlphttp/backend` (OTLP/HTTP)
-- **Commented:** `otlp/backend` (OTLP/gRPC) — uncomment exporter + swap pipeline exporters when you need gRPC
-
-## Architecture
-
-```
-Browser (React RUM) ──/otlp──► nginx ──► collector ──► backend (OpenObserve by default)
-   │
-   ▼
-BFF (Node) ──OpenFeature──► flagd
-Orders (Python) ──OpenFeature──► flagd
-Worker (Go) ──OpenFeature──► flagd
-   │
-   ├─ Catalog (Java) → Postgres
-   ├─ Open-Meteo / Stripe
-   └─ RabbitMQ → Worker → JSONPlaceholder
-```
+Polyglot microservices demo instrumented with **OpenTelemetry** (RUM, traces, logs, metrics). Apps export OTLP to a **Collector**; the default backend is OpenObserve but is swappable via env.
 
 ## Quick start
 
@@ -46,44 +10,36 @@ cp .env.example .env
 docker compose up --build
 ```
 
-UI: http://localhost:5173
+- UI (multi-page RUM): http://localhost:5173  
+- Locust journeys: `docker compose --profile loadgen up --build locust` → http://localhost:8089  
+- Worker health: http://localhost:8083/health  
 
-## OpenFeature chaos gates
+## Pages (RUM)
 
-Error / latency scenarios are **feature flags**, not hard-coded in the request path.
+| Route | Why it exists |
+|-------|----------------|
+| `/login` | User session spans |
+| `/catalog` | Browse interactions |
+| `/checkout` | Order create |
+| `/orders` | Status polling / table |
+| `/gates` | OpenFeature chaos on/off UI |
+| `/account` | Extra route for page metrics |
 
-- Flag definitions: `flags/chaos.flagd.json`
-- Runtime control plane: **flagd** (hot-reloads the file)
-- UI **Apply feature gates** → `PUT /api/flags/chaos` → writes the flag file
-- Or edit the file / call the API from outside the app
+## Automation: Locust vs Playwright
 
-Services evaluate flags on each request/consume via OpenFeature. Spans include `feature_flag.source=openfeature/flagd` and `chaos.*`.
+**Prefer Locust** for volume and intermittent backend faults (many concurrent login→checkout→poll flows). It hits the BFF API and can randomly apply chaos gates.
 
-```bash
-# Example: enable Open-Meteo failures from outside
-curl -X PUT http://localhost:3000/api/flags/chaos \
-  -H 'content-type: application/json' \
-  -d '{"chaos":{"fail_open_meteo":true,"orders_latency_ms":1500}}'
-```
+**Use Playwright** (`scripts/playwright-journey.mjs`) when you need **real browser RUM** across SPA routes.
 
-## Orders table
+See `loadgen/README.md` and `docs/chaos-and-feature-flags.md`.
 
-- Loaded from Postgres, auto-refresh every 2s
-- Status: `pending` → `processing` → `processed` / `failed`
-- **Clear all** wipes demo rows
+## Docs
 
-## RUM
+- [Architecture](docs/architecture.md)
+- [Contributing](CONTRIBUTING.md)
+- [Chaos / OpenFeature](docs/chaos-and-feature-flags.md)
+- Services: [frontend](docs/services/frontend.md) · [bff](docs/services/bff.md) · [orders](docs/services/orders.md) · [catalog](docs/services/catalog.md) · [worker](docs/services/worker.md)
 
-Browser exports to same-origin `/otlp` (nginx → collector). Filter OpenObserve (or any backend) by `service.name="frontend-rum"` or `session.id`.
+## Pluggable backends
 
-## Local ports
-
-| Service | Port |
-|---------|------|
-| UI | 5173 |
-| BFF | 3000 |
-| Orders | 8081 |
-| Catalog | 8082 |
-| flagd gRPC / OFREP | 8013 / 8014 |
-| Collector OTLP | 4317 / 4318 |
-| RabbitMQ UI | 15672 (`otel`/`otel`) |
+Apps → Collector only. Configure `OTEL_BACKEND_*` (OTLP/HTTP default; OTLP/gRPC commented in `otel-collector/config.yaml`).

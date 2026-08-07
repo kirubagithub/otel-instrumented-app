@@ -42,6 +42,38 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'bff-service' });
 });
 
+/** Demo session endpoints for multi-page RUM user journeys (not real auth). */
+app.post('/api/session/login', (req, res) => {
+  const span = tracer.startSpan('bff.session_login');
+  try {
+    const email = String(req.body?.email || '').trim();
+    const name = String(req.body?.name || 'Shopper').trim();
+    const id = String(req.body?.id || `user-${email.split('@')[0] || 'anon'}`);
+    if (!email) {
+      res.status(400).json({ error: 'email_required' });
+      return;
+    }
+    span.setAttribute('user.id', id);
+    span.setAttribute('user.email', email);
+    res.json({ user: { id, email, name } });
+  } catch (err) {
+    span.recordException(err);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+    res.status(500).json({ error: 'login_failed', detail: err.message });
+  } finally {
+    span.end();
+  }
+});
+
+app.post('/api/session/logout', (_req, res) => {
+  const span = tracer.startSpan('bff.session_logout');
+  try {
+    res.json({ ok: true });
+  } finally {
+    span.end();
+  }
+});
+
 app.get('/api/flags/chaos', async (_req, res) => {
   const span = tracer.startSpan('bff.get_chaos_flags');
   try {

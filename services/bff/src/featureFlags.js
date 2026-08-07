@@ -1,7 +1,6 @@
-import { OpenFeature } from '@openfeature/server-sdk';
+import { OpenFeature, ProviderEvents } from '@openfeature/server-sdk';
 import { FlagdProvider } from '@openfeature/flagd-provider';
 import fs from 'node:fs/promises';
-import path from 'node:path';
 
 const FLAG_FILE = process.env.FLAGD_FILE || '/etc/flagd/chaos.flagd.json';
 
@@ -22,42 +21,83 @@ const BOOL_KEYS = [
   'chaos.fail_publish',
 ];
 
-let ready;
-export function initFeatureFlags() {
-  if (!ready) {
-    const host = process.env.FLAGD_HOST || 'flagd';
-    const port = Number(process.env.FLAGD_PORT || 8013);
-    OpenFeature.setProvider(new FlagdProvider({ host, port, tls: false, deadline: 3000 }));
-    ready = OpenFeature.setContext({ targetingKey: 'bff-service' }).then(() => {
-      console.log(`OpenFeature flagd provider ready at ${host}:${port}`);
-    }).catch((err) => {
-      console.warn('OpenFeature init warning:', err.message);
-    });
-  }
-  return ready;
-}
+let readyPromise;
 
 function shortName(key) {
   return key.replace(/^chaos\./, '');
 }
 
-export async function resolveChaos(targetingKey = 'anonymous') {
-  await initFeatureFlags();
-  const client = OpenFeature.getClient('bff-service');
-  const ctx = { targetingKey };
+function defaultsFromDoc(doc) {
   const out = {};
   for (const key of LATENCY_KEYS) {
-    out[shortName(key)] = await client.getNumberValue(key, 0, ctx);
+    const flag = doc?.flags?.[key];
+    const variant = flag?.defaultVariant || 'off';
+    out[shortName(key)] = Number(flag?.variants?.[variant] ?? 0) || 0;
   }
   for (const key of BOOL_KEYS) {
-    out[shortName(key)] = await client.getBooleanValue(key, false, ctx);
+    const flag = doc?.flags?.[key];
+    const variant = flag?.defaultVariant || 'off';
+    out[shortName(key)] = Boolean(flag?.variants?.[variant] ?? false);
   }
   return out;
 }
 
+/** File-backed fallback so Gates UI works even if flagd RPC is briefly down. */
+async function resolveChaosFromFile() {
+  try {
+    const raw = await fs.readFile(FLAG_FILE, 'utf8');
+    return defaultsFromDoc(JSON.parse(raw));
+  } catch {
+    return defaultsFromDoc({ flags: {} });
+  }
+}
+
+export function initFeatureFlags() {
+  if (!readyPromise) {
+    readyPromise = (async () => {
+      const host = process.env.FLAGD_HOST || 'flagd';
+      const port = Number(process.env.FLAGD_PORT || 8013);
+      try {
+        // setContext is synchronous in @openfeature/server-sdk (does not return a Promise).
+        OpenFeature.setContext({ targetingKey: 'bff-service' });
+
+        OpenFeature.addHandler(ProviderEvents.Error, (event) => {
+          console.warn('[openfeature] provider error (continuing with defaults):', event?.message || event);
+        });
+        OpenFeature.addHandler(ProviderEvents.Ready, () => {
+          console.log(`[openfeature] flagd ready at ${host}:${port}`);
+        });
+
+        const maybePromise = OpenFeature.setProvider(
+          new FlagdProvider({
+            host,
+            port,
+            tls: false,
+            maxEventStreamRetries: 50,
+          })
+        );
+        if (maybePromise && typeof maybePromise.then === 'function') {
+          await maybePromise;
+        }
+        console.log(`OpenFeature flagd provider registered at ${host}:${port}`);
+      } catch (err) {
+        console.warn('OpenFeature init warning (file fallback enabled):', err.message);
+      }
+    })();
+  }
+  return readyPromise;
+}
+
+export async function resolveChaos(targetingKey = 'anonymous') {
+  await initFeatureFlags();
+  // BFF owns the shared flag file — use it as source of truth for gateway decisions
+  // (flagd still serves orders/worker; file hot-reload keeps them in sync).
+  void targetingKey;
+  return resolveChaosFromFile();
+}
+
 function variantForNumber(value) {
   if (!value || value <= 0) return 'off';
-  if (value >= 3000) return 'high';
   if (value >= 1000) return 'high';
   return 'low';
 }
@@ -76,7 +116,6 @@ function numberVariantValue(flagKey, variant) {
 
 /**
  * Update flagd file on shared volume. flagd watches the file and hot-reloads.
- * This is the "outside" control plane for chaos feature gates.
  */
 export async function updateChaosFlags(chaos) {
   const raw = await fs.readFile(FLAG_FILE, 'utf8');
@@ -88,7 +127,6 @@ export async function updateChaosFlags(chaos) {
     if (chaos[short] === undefined) continue;
     const ms = Number(chaos[short]) || 0;
     let variant = variantForNumber(ms);
-    // If custom value doesn't match presets, inject a custom variant
     const variants = {
       off: 0,
       low: numberVariantValue(key, 'low'),
@@ -119,7 +157,6 @@ export async function updateChaosFlags(chaos) {
   const tmp = `${FLAG_FILE}.tmp`;
   await fs.writeFile(tmp, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
   await fs.rename(tmp, FLAG_FILE);
-  // Give flagd a moment to reload before callers re-evaluate
   await new Promise((r) => setTimeout(r, 400));
   return resolveChaos('flag-admin');
 }

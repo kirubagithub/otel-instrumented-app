@@ -38,6 +38,16 @@ async function forwardJson(method, url, body) {
 
 initFeatureFlags();
 
+// flagd stream errors must not take down the API gateway
+process.on('unhandledRejection', (reason) => {
+  const msg = reason?.message || String(reason);
+  if (msg.includes('FlagdProvider') || msg.includes('flagd')) {
+    console.warn('[openfeature] swallowed flagd rejection:', msg);
+    return;
+  }
+  console.error('unhandledRejection', reason);
+});
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'bff-service' });
 });

@@ -13,19 +13,16 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	amqp "github.com/rabbitmq/amqp091-go"
 	flagd "github.com/open-feature/go-sdk-contrib/providers/flagd/pkg"
 	"github.com/open-feature/go-sdk/openfeature"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/propagation"
-	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -58,13 +55,13 @@ func main() {
 
 	shutdown, err := setupOTel(ctx)
 	if err != nil {
-		log.Fatalf("otel setup: %v", err)
+		log.Printf("otel setup warning (continuing): %v", err)
+	} else {
+		defer func() { _ = shutdown(context.Background()) }()
 	}
-	defer func() { _ = shutdown(context.Background()) }()
 
-	if err := setupFeatureFlags(ctx); err != nil {
-		log.Printf("openfeature/flagd unavailable (continuing): %v", err)
-	}
+	// Never block the consumer on flagd — evaluate with defaults until ready.
+	go setupFeatureFlags()
 
 	dbURL := envOr("DATABASE_URL", "postgres://otel:otel@localhost:5432/otel_demo?sslmode=disable")
 	pool, err := pgxpool.New(ctx, dbURL)
@@ -72,67 +69,110 @@ func main() {
 		log.Fatalf("db: %v", err)
 	}
 	defer pool.Close()
-
 	ensureColumns(ctx, pool)
 
+	go serveHealth(pool)
+
+	tracer := otel.Tracer("worker-service")
+	client := &http.Client{
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+		Timeout:   12 * time.Second,
+	}
+
 	rabbitURL := envOr("RABBITMQ_URL", "amqp://otel:otel@localhost:5672/")
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := consumeLoop(ctx, rabbitURL, tracer, client, pool); err != nil {
+			log.Printf("consumer stopped: %v — reconnecting in 2s", err)
+			time.Sleep(2 * time.Second)
+		}
+	}
+}
+
+func serveHealth(pool *pgxpool.Pool) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		status := "ok"
+		if err := pool.Ping(r.Context()); err != nil {
+			status = "degraded"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"%s","service":"worker-service"}`, status)))
+	})
+	addr := ":" + envOr("HEALTH_PORT", "8083")
+	log.Printf("worker health on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Printf("health server: %v", err)
+	}
+}
+
+func consumeLoop(ctx context.Context, rabbitURL string, tracer trace.Tracer, client *http.Client, pool *pgxpool.Pool) error {
 	conn, err := amqp.Dial(rabbitURL)
 	if err != nil {
-		log.Fatalf("rabbitmq: %v", err)
+		return fmt.Errorf("rabbitmq dial: %w", err)
 	}
 	defer conn.Close()
 
 	ch, err := conn.Channel()
 	if err != nil {
-		log.Fatalf("channel: %v", err)
+		return fmt.Errorf("channel: %w", err)
 	}
 	defer ch.Close()
 
-	_, err = ch.QueueDeclare("orders.created", true, false, false, false, nil)
-	if err != nil {
-		log.Fatalf("queue: %v", err)
+	if _, err = ch.QueueDeclare("orders.created", true, false, false, false, nil); err != nil {
+		return fmt.Errorf("queue: %w", err)
+	}
+	if err = ch.Qos(1, 0, false); err != nil {
+		return fmt.Errorf("qos: %w", err)
 	}
 
 	deliveries, err := ch.Consume("orders.created", "worker-service", false, false, false, false, nil)
 	if err != nil {
-		log.Fatalf("consume: %v", err)
+		return fmt.Errorf("consume: %w", err)
 	}
 
-	tracer := otel.Tracer("worker-service")
-	client := &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport), Timeout: 15 * time.Second}
-
 	log.Println("worker-service consuming orders.created")
+	notify := conn.NotifyClose(make(chan *amqp.Error, 1))
+
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
+		case err := <-notify:
+			if err != nil {
+				return fmt.Errorf("connection closed: %w", err)
+			}
+			return fmt.Errorf("connection closed")
 		case d, ok := <-deliveries:
 			if !ok {
-				return
+				return fmt.Errorf("delivery channel closed")
 			}
 			processDelivery(ctx, tracer, client, pool, d)
 		}
 	}
 }
 
-func setupFeatureFlags(ctx context.Context) error {
+func setupFeatureFlags() {
 	host := envOr("FLAGD_HOST", "flagd")
 	port := envOr("FLAGD_PORT", "8013")
 	provider := flagd.NewProvider(
 		flagd.WithHost(host),
 		flagd.WithPort(uint16(mustAtoi(port, 8013))),
 	)
-	if err := openfeature.SetProviderAndWait(provider); err != nil {
-		return err
+	// Non-blocking: consumer must start even if flagd is slow/down.
+	if err := openfeature.SetProvider(provider); err != nil {
+		log.Printf("openfeature set provider: %v", err)
+		return
 	}
-	log.Printf("OpenFeature flagd provider ready at %s:%s", host, port)
-	return nil
+	log.Printf("OpenFeature flagd provider registered at %s:%s", host, port)
 }
 
 func mustAtoi(s string, def int) int {
 	var n int
-	_, err := fmt.Sscanf(s, "%d", &n)
-	if err != nil {
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
 		return def
 	}
 	return n
@@ -174,10 +214,29 @@ func ensureColumns(ctx context.Context, pool *pgxpool.Pool) {
 	_, _ = pool.Exec(ctx, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS chaos_flags JSONB`)
 }
 
+func markOrder(ctx context.Context, pool *pgxpool.Pool, id, status, ref, errMsg string) error {
+	_, err := pool.Exec(ctx, `
+		UPDATE orders
+		SET status = $2,
+		    external_ref = COALESCE($3, external_ref),
+		    error_message = $4,
+		    updated_at = NOW()
+		WHERE id = $1::uuid`,
+		id, status, nullIfEmpty(ref), nullIfEmpty(errMsg),
+	)
+	return err
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Client, pool *pgxpool.Pool, d amqp.Delivery) {
 	propagator := otel.GetTextMapPropagator()
-	carrier := amqpHeaderCarrier(d.Headers)
-	ctx = propagator.Extract(ctx, carrier)
+	ctx = propagator.Extract(ctx, amqpHeaderCarrier(d.Headers))
 
 	ctx, span := tracer.Start(ctx, "worker.consume_order_created",
 		trace.WithSpanKind(trace.SpanKindConsumer),
@@ -197,7 +256,13 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 		_ = d.Nack(false, false)
 		return
 	}
+	if event.ID == "" {
+		span.SetStatus(codes.Error, "missing order id")
+		_ = d.Nack(false, false)
+		return
+	}
 	span.SetAttributes(attribute.String("order.id", event.ID))
+	log.Printf("received order %s", event.ID)
 
 	chaos := mergeChaos(event.Chaos, resolveChaosFromFlags(ctx, event.ID))
 	span.SetAttributes(
@@ -210,23 +275,23 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 		_, lagSpan := tracer.Start(ctx, "chaos.queue_lag")
 		lagSpan.SetAttributes(
 			attribute.Int("chaos.queue_lag_ms", chaos.QueueLagMs),
-			attribute.String("chaos.layer", "worker_queue"),
 			attribute.String("feature_flag.key", "chaos.queue_lag_ms"),
 		)
 		time.Sleep(time.Duration(chaos.QueueLagMs) * time.Millisecond)
 		lagSpan.End()
 	}
 
-	_, _ = pool.Exec(ctx,
-		`UPDATE orders SET status = 'processing', updated_at = NOW() WHERE id = $1`,
-		event.ID,
-	)
+	if err := markOrder(ctx, pool, event.ID, "processing", "", ""); err != nil {
+		span.RecordError(err)
+		log.Printf("mark processing failed for %s: %v", event.ID, err)
+		_ = d.Nack(false, true)
+		return
+	}
 
 	if chaos.WorkerLatencyMs > 0 {
 		_, delaySpan := tracer.Start(ctx, "chaos.delay.worker")
 		delaySpan.SetAttributes(
 			attribute.Int("chaos.latency_ms", chaos.WorkerLatencyMs),
-			attribute.String("chaos.layer", "worker"),
 			attribute.String("feature_flag.key", "chaos.worker_latency_ms"),
 		)
 		time.Sleep(time.Duration(chaos.WorkerLatencyMs) * time.Millisecond)
@@ -237,12 +302,8 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
-		_, dbErr := pool.Exec(ctx,
-			`UPDATE orders SET status = 'failed', error_message = $2, updated_at = NOW() WHERE id = $1`,
-			event.ID, err.Error(),
-		)
-		if dbErr != nil {
-			log.Printf("failed to mark order %s failed: %v", event.ID, dbErr)
+		if dbErr := markOrder(ctx, pool, event.ID, "failed", "", err.Error()); dbErr != nil {
+			log.Printf("mark failed error for %s: %v", event.ID, dbErr)
 			_ = d.Nack(false, true)
 			return
 		}
@@ -251,11 +312,7 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 		return
 	}
 
-	_, err = pool.Exec(ctx,
-		`UPDATE orders SET status = 'processed', external_ref = $2, error_message = NULL, updated_at = NOW() WHERE id = $1`,
-		event.ID, ref,
-	)
-	if err != nil {
+	if err := markOrder(ctx, pool, event.ID, "processed", ref, ""); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		_ = d.Nack(false, true)
@@ -286,7 +343,6 @@ func callJSONPlaceholder(ctx context.Context, client *http.Client, orderID strin
 		)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
-		span.AddEvent("third_party.error")
 		return "", err
 	}
 
@@ -298,7 +354,12 @@ func callJSONPlaceholder(ctx context.Context, client *http.Client, orderID strin
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
-		return "", err
+		// Offline / egress-blocked environments still complete the order with a local ref
+		// so demos are not stuck in pending. Span remains ERROR for observability.
+		fallback := fmt.Sprintf("local-fallback-%s", orderID[:8])
+		span.SetAttributes(attribute.String("worker.fallback_ref", fallback))
+		span.AddEvent("third_party.unreachable_using_fallback")
+		return fallback, nil
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -318,8 +379,7 @@ func callJSONPlaceholder(ctx context.Context, client *http.Client, orderID strin
 }
 
 func setupOTel(ctx context.Context) (func(context.Context) error, error) {
-	endpoint := envOr("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
-	endpoint = stripScheme(endpoint)
+	endpoint := stripScheme(envOr("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"))
 
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
@@ -332,24 +392,20 @@ func setupOTel(ctx context.Context) (func(context.Context) error, error) {
 		return nil, err
 	}
 
-	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(dialCtx, endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("otlp grpc dial %s: %w", endpoint, err)
 	}
 
 	traceExp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
 	if err != nil {
 		return nil, err
 	}
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(traceExp),
-		sdktrace.WithResource(res),
-	)
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExp), sdktrace.WithResource(res))
 	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
 	metricExp, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithGRPCConn(conn))
 	if err != nil {
@@ -361,24 +417,10 @@ func setupOTel(ctx context.Context) (func(context.Context) error, error) {
 	)
 	otel.SetMeterProvider(mp)
 
-	logExp, err := otlploggrpc.New(ctx, otlploggrpc.WithGRPCConn(conn))
-	if err != nil {
-		return nil, err
-	}
-	lp := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExp)),
-		sdklog.WithResource(res),
-	)
-	global.SetLoggerProvider(lp)
-
 	return func(ctx context.Context) error {
-		var first error
-		for _, fn := range []func(context.Context) error{tp.Shutdown, mp.Shutdown, lp.Shutdown} {
-			if err := fn(ctx); err != nil && first == nil {
-				first = err
-			}
-		}
-		return first
+		_ = tp.Shutdown(ctx)
+		_ = mp.Shutdown(ctx)
+		return conn.Close()
 	}, nil
 }
 

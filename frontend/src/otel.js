@@ -10,7 +10,7 @@ import { DocumentLoadInstrumentation } from '@opentelemetry/instrumentation-docu
 import { FetchInstrumentation } from '@opentelemetry/instrumentation-fetch';
 import { UserInteractionInstrumentation } from '@opentelemetry/instrumentation-user-interaction';
 import { W3CTraceContextPropagator } from '@opentelemetry/core';
-import { propagation } from '@opentelemetry/api';
+import { propagation, trace } from '@opentelemetry/api';
 
 function resolveOtlpBase() {
   const configured = (import.meta.env.VITE_OTEL_EXPORTER_OTLP_ENDPOINT || '').trim().replace(/\/$/, '');
@@ -80,6 +80,15 @@ window.addEventListener('pagehide', () => {
 });
 
 console.info('[rum] exporting traces to', `${otlpEndpoint}/v1/traces`, 'session', sessionId);
+
+/** Emit a page-view span on client-side route changes (SPA RUM). */
+export function recordRouteView(path) {
+  const span = trace.getTracer('frontend-rum').startSpan('ui.page_view');
+  span.setAttribute('session.id', sessionId);
+  span.setAttribute('url.path', path);
+  span.setAttribute('http.route', path);
+  span.end();
+}
 
 export { provider, sessionId, flushRum };
 export default provider;

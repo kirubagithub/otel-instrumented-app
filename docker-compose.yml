@@ -121,10 +121,13 @@ services:
       DATABASE_URL: postgres://otel:otel@postgres:5432/otel_demo?sslmode=disable
       FLAGD_HOST: flagd
       FLAGD_PORT: "8013"
+      HEALTH_PORT: "8083"
       OTEL_SERVICE_NAME: worker-service
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       OTEL_EXPORTER_OTLP_PROTOCOL: grpc
       OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
+    ports:
+      - "8083:8083"
     depends_on:
       postgres:
         condition: service_healthy
@@ -174,6 +177,18 @@ services:
     depends_on:
       - bff
       - otel-collector
+
+  # Optional API journey generator (Locust). Does not produce browser RUM.
+  locust:
+    profiles: ["loadgen"]
+    build: ./loadgen
+    environment:
+      CHAOS_INTERMITTENT: ${CHAOS_INTERMITTENT:-true}
+    ports:
+      - "8089:8089"
+    depends_on:
+      - bff
+    command: ["locust", "-f", "locustfile.py", "--host", "http://bff:3000"]
 
 volumes:
   pgdata:

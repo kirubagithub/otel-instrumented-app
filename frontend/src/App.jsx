@@ -36,6 +36,8 @@ export default function App() {
   const [clearing, setClearing] = useState(false);
   const [chaos, setChaos] = useState(DEFAULT_CHAOS);
   const [lastCreatedId, setLastCreatedId] = useState(null);
+  const [savingFlags, setSavingFlags] = useState(false);
+  const [flagsMsg, setFlagsMsg] = useState('');
 
   const loadOrders = useCallback(async () => {
     try {
@@ -43,6 +45,17 @@ export default function App() {
       if (!r.ok) throw new Error(`list orders ${r.status}`);
       const data = await r.json();
       setOrders(Array.isArray(data) ? data : []);
+    } catch (e) {
+      setError(e.message);
+    }
+  }, []);
+
+  const loadFlags = useCallback(async () => {
+    try {
+      const r = await fetch(`${BFF}/api/flags/chaos`);
+      if (!r.ok) throw new Error(`flags ${r.status}`);
+      const data = await r.json();
+      if (data?.chaos) setChaos({ ...DEFAULT_CHAOS, ...data.chaos });
     } catch (e) {
       setError(e.message);
     }
@@ -69,7 +82,8 @@ export default function App() {
       .finally(() => span.end());
 
     loadOrders();
-  }, [loadOrders]);
+    loadFlags();
+  }, [loadOrders, loadFlags]);
 
   // Keep order statuses fresh from Postgres (worker updates).
   useEffect(() => {
@@ -88,6 +102,33 @@ export default function App() {
     setChaos((prev) => ({ ...prev, [key]: value }));
   }
 
+  async function applyFeatureGates(e) {
+    e?.preventDefault?.();
+    setSavingFlags(true);
+    setFlagsMsg('');
+    setError('');
+    const span = tracer.startSpan('ui.apply_feature_gates');
+    try {
+      const res = await fetch(`${BFF}/api/flags/chaos`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chaos }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || data.error || `flags ${res.status}`);
+      if (data.chaos) setChaos({ ...DEFAULT_CHAOS, ...data.chaos });
+      setFlagsMsg('Feature gates applied via OpenFeature/flagd');
+      span.setAttribute('feature_flag.source', 'openfeature/flagd');
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      setError(err.message);
+    } finally {
+      span.end();
+      setSavingFlags(false);
+    }
+  }
+
   async function createOrder(e) {
     e.preventDefault();
     setLoading(true);
@@ -97,9 +138,10 @@ export default function App() {
     span.setAttribute('session.id', sessionId);
     span.setAttribute('order.product_id', Number(productId));
     span.setAttribute('order.quantity', Number(quantity));
-    span.setAttribute('chaos.enabled', Object.values(chaos).some((v) => v && v !== 0));
+    span.setAttribute('feature_flag.source', 'openfeature/flagd');
 
     try {
+      // Chaos comes from OpenFeature gates (apply above), not the request body.
       const res = await fetch(`${BFF}/api/orders`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -108,7 +150,6 @@ export default function App() {
           quantity: Number(quantity),
           latitude: 40.71,
           longitude: -74.01,
-          chaos,
         }),
       });
       const data = await res.json();
@@ -199,9 +240,11 @@ export default function App() {
           </form>
 
           <div className="chaos">
-            <h3>Chaos / fault injection</h3>
+            <h3>OpenFeature chaos gates</h3>
             <p className="hint tight">
-              Inject latency, queue lag, or third-party failures. Spans get <code>chaos.*</code> attributes.
+              Controlled outside the request via <strong>flagd</strong>. Apply gates, then create an order.
+              Spans include <code>feature_flag.source</code> and <code>chaos.*</code>.
+              You can also edit <code>flags/chaos.flagd.json</code> directly.
             </p>
             <div className="chaos-grid">
               {[
@@ -243,6 +286,10 @@ export default function App() {
                 </label>
               ))}
             </div>
+            <button type="button" className="ghost apply-flags" onClick={applyFeatureGates} disabled={savingFlags}>
+              {savingFlags ? 'Applying…' : 'Apply feature gates'}
+            </button>
+            {flagsMsg && <p className="hint tight">{flagsMsg}</p>}
           </div>
 
           {error && <p className="error">{error}</p>}

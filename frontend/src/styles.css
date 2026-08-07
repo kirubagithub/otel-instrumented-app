@@ -142,6 +142,13 @@ button.danger {
   font-size: 0.85rem;
 }
 
+button.apply-flags {
+  margin-top: 0.85rem;
+  width: 100%;
+  padding: 0.7rem 1rem;
+  font-size: 0.95rem;
+}
+
 button.ghost {
   background: transparent;
   color: var(--ink);

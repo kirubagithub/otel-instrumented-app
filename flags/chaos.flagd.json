@@ -1,0 +1,99 @@
+{
+  "$schema": "https://flagd.dev/schema/v0/flags.json",
+  "flags": {
+    "chaos.bff_latency_ms": {
+      "state": "ENABLED",
+      "variants": {
+        "off": 0,
+        "low": 500,
+        "high": 2000
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.catalog_latency_ms": {
+      "state": "ENABLED",
+      "variants": {
+        "off": 0,
+        "low": 500,
+        "high": 2000
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.orders_latency_ms": {
+      "state": "ENABLED",
+      "variants": {
+        "off": 0,
+        "low": 500,
+        "high": 2000
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.worker_latency_ms": {
+      "state": "ENABLED",
+      "variants": {
+        "off": 0,
+        "low": 500,
+        "high": 2000
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.queue_lag_ms": {
+      "state": "ENABLED",
+      "variants": {
+        "off": 0,
+        "low": 1000,
+        "high": 5000
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.slow_close_ms": {
+      "state": "ENABLED",
+      "variants": {
+        "off": 0,
+        "low": 1000,
+        "high": 3000
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.fail_open_meteo": {
+      "state": "ENABLED",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.fail_stripe": {
+      "state": "ENABLED",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.fail_jsonplaceholder": {
+      "state": "ENABLED",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.fail_catalog": {
+      "state": "ENABLED",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "defaultVariant": "off"
+    },
+    "chaos.fail_publish": {
+      "state": "ENABLED",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "defaultVariant": "off"
+    }
+  }
+}

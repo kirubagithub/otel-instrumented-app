@@ -12,3 +12,5 @@ opentelemetry-instrumentation-psycopg==0.50b0
 opentelemetry-instrumentation-logging==0.50b0
 opentelemetry-instrumentation-system-metrics==0.50b0
 stripe==11.4.1
+openfeature-sdk==0.8.1
+openfeature-provider-flagd==0.1.5

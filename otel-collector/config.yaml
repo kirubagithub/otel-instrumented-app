@@ -1,8 +1,9 @@
 # OpenTelemetry Collector
 #
-# Apps and RUM always export HERE (OTLP). Swap observability backends by
-# changing exporter env vars / which exporter is enabled in pipelines —
-# no application code changes required.
+# Apps and RUM always export HERE via OTLP/HTTP (default :4318).
+# gRPC (:4317) remains enabled for tools/debugging but app services use HTTP.
+#
+# Swap observability backends with OTEL_BACKEND_* env vars — no app code changes.
 #
 # Default backend exporter: otlphttp/backend (OTLP/HTTP)
 # Alternate (commented):     otlp/backend     (OTLP/gRPC)

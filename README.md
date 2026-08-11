@@ -42,4 +42,6 @@ See `loadgen/README.md` and `docs/chaos-and-feature-flags.md`.
 
 ## Pluggable backends
 
-Apps → Collector only. Configure `OTEL_BACKEND_*` (OTLP/HTTP default; OTLP/gRPC commented in `otel-collector/config.yaml`).
+Apps → Collector only (shared OTLP/HTTP). Configure `OTEL_BACKEND_*` for OpenObserve or another product.
+
+See [Telemetry wiring](docs/telemetry.md) for ingest vs backend env vars and port mapping.

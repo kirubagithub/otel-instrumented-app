@@ -20,6 +20,12 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 def setup_telemetry(app):
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318").rstrip("/")
+    protocol = os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf").lower()
+    if protocol not in ("http/protobuf", "http/json"):
+        logging.getLogger("orders-service").warning(
+            "OTEL_EXPORTER_OTLP_PROTOCOL=%s — orders uses OTLP/HTTP exporters; use http/protobuf (lab default).",
+            protocol,
+        )
     service_name = os.getenv("OTEL_SERVICE_NAME", "orders-service")
     resource = Resource.create(
         {

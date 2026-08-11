@@ -12,6 +12,13 @@ import {
 } from '@opentelemetry/semantic-conventions';
 
 const endpoint = (process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:4318').replace(/\/$/, '');
+const protocol = (process.env.OTEL_EXPORTER_OTLP_PROTOCOL || 'http/protobuf').toLowerCase();
+
+if (protocol !== 'http/protobuf' && protocol !== 'http/json') {
+  console.warn(
+    `[otel] OTEL_EXPORTER_OTLP_PROTOCOL=${protocol} — bff uses OTLP/HTTP exporters; set http/protobuf (lab default).`
+  );
+}
 
 const sdk = new NodeSDK({
   resource: new Resource({

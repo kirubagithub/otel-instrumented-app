@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,16 +21,14 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 type chaosOptions struct {
@@ -379,7 +378,8 @@ func callJSONPlaceholder(ctx context.Context, client *http.Client, orderID strin
 }
 
 func setupOTel(ctx context.Context) (func(context.Context) error, error) {
-	endpoint := stripScheme(envOr("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"))
+	// Shared lab default: OTLP/HTTP to local collector (same as all other services).
+	endpoint := strings.TrimRight(envOr("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"), "/")
 
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
@@ -392,24 +392,17 @@ func setupOTel(ctx context.Context) (func(context.Context) error, error) {
 		return nil, err
 	}
 
-	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(dialCtx, endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	traceExp, err := otlptracehttp.New(ctx, otlptracehttp.WithEndpointURL(endpoint+"/v1/traces"))
 	if err != nil {
-		return nil, fmt.Errorf("otlp grpc dial %s: %w", endpoint, err)
-	}
-
-	traceExp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("otlp http traces: %w", err)
 	}
 	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExp), sdktrace.WithResource(res))
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
-	metricExp, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithGRPCConn(conn))
+	metricExp, err := otlpmetrichttp.New(ctx, otlpmetrichttp.WithEndpointURL(endpoint+"/v1/metrics"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("otlp http metrics: %w", err)
 	}
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExp, sdkmetric.WithInterval(15*time.Second))),
@@ -420,7 +413,7 @@ func setupOTel(ctx context.Context) (func(context.Context) error, error) {
 	return func(ctx context.Context) error {
 		_ = tp.Shutdown(ctx)
 		_ = mp.Shutdown(ctx)
-		return conn.Close()
+		return nil
 	}, nil
 }
 
@@ -429,15 +422,6 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
-}
-
-func stripScheme(endpoint string) string {
-	for _, p := range []string{"https://", "http://"} {
-		if len(endpoint) > len(p) && endpoint[:len(p)] == p {
-			return endpoint[len(p):]
-		}
-	}
-	return endpoint
 }
 
 func amqpHeaderCarrier(h amqp.Table) propagation.TextMapCarrier {

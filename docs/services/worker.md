@@ -16,6 +16,7 @@ Consumes `orders.created` from RabbitMQ, calls JSONPlaceholder, updates order st
 ## Telemetry
 - Consumer span `worker.consume_order_created`
 - CLIENT span `worker.call_jsonplaceholder`
+- OTLP/**HTTP** to the local collector (same as all other services)
 - Propagates `traceparent` from AMQP headers
 
 ## Key files

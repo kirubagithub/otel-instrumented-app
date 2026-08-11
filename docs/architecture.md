@@ -18,7 +18,8 @@ Locust (optional) → BFF HTTP journeys
 
 ## Telemetry rule
 
-Services **only** talk OTLP to the Collector. Swap backends with `OTEL_BACKEND_*` (see `otel-collector/config.yaml`).
+Services **only** talk OTLP/HTTP to the local Collector (`OTEL_EXPORTER_OTLP_ENDPOINT`).  
+Swap backends with `OTEL_BACKEND_*` (see `otel-collector/config.yaml` and [telemetry.md](./telemetry.md)).
 
 ## User journey (manual or Locust)
 

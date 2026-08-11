@@ -35,11 +35,11 @@ UI: http://localhost:5173 · Locust: http://localhost:8089 · Worker health: htt
 
 ## Adding a service
 
-1. Emit OTLP to `otel-collector:4317` (gRPC) or `:4318` (HTTP).
+1. Emit OTLP/HTTP to the local collector (`OTEL_EXPORTER_OTLP_ENDPOINT`, shared via Compose `x-otel-env`).
 2. Propagate `traceparent` on HTTP and messaging.
 3. Tag third-party CLIENT spans with `peer.service` / `dependency.type=third_party`.
 4. Document the service under `docs/services/`.
-5. Wire it in `docker-compose.yml`.
+5. Wire it in `docker-compose.yml` using `<<: *otel-env`.
 
 ## Adding a chaos gate
 

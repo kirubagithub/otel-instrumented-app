@@ -1,3 +1,13 @@
+# Shared OTLP settings for all app services (HTTP → local collector).
+# Override host/ports in .env if needed; internal collector ports stay 4317/4318.
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://${OTEL_COLLECTOR_HOST:-otel-collector}:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: otlp
+  OTEL_LOGS_EXPORTER: otlp
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -24,7 +34,6 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: otel
       RABBITMQ_DEFAULT_PASS: otel
-    # `ping` can succeed before the AMQP listener is bound; wait for port readiness.
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
       interval: 5s
@@ -32,7 +41,6 @@ services:
       retries: 20
       start_period: 20s
 
-  # OpenFeature flagd — chaos / error-scenario feature gates (hot-reloads file)
   flagd:
     image: ghcr.io/open-feature/flagd:v0.11.4
     command: ["start", "--uri", "file:/etc/flagd/chaos.flagd.json"]
@@ -48,7 +56,6 @@ services:
     volumes:
       - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
     environment:
-      # Swap backends here — apps keep exporting to this collector only.
       OTEL_BACKEND_OTLP_HTTP_ENDPOINT: ${OTEL_BACKEND_OTLP_HTTP_ENDPOINT:-https://api.openobserve.ai/api/default}
       OTEL_BACKEND_AUTHORIZATION: ${OTEL_BACKEND_AUTHORIZATION:-Basic REPLACE_ME}
       OTEL_BACKEND_HEADER_ORGANIZATION: ${OTEL_BACKEND_HEADER_ORGANIZATION:-default}
@@ -56,8 +63,9 @@ services:
       OTEL_BACKEND_OTLP_GRPC_ENDPOINT: ${OTEL_BACKEND_OTLP_GRPC_ENDPOINT:-localhost:4317}
       OTEL_BACKEND_OTLP_GRPC_TLS_INSECURE: ${OTEL_BACKEND_OTLP_GRPC_TLS_INSECURE:-true}
     ports:
-      - "4317:4317"
-      - "4318:4318"
+      # Host port → fixed internal 4317/4318 (simple mapping)
+      - "${OTEL_COLLECTOR_GRPC_PORT:-4317}:4317"
+      - "${OTEL_COLLECTOR_HTTP_PORT:-4318}:4318"
       - "13133:13133"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:13133"]
@@ -68,28 +76,24 @@ services:
   catalog:
     build: ./services/catalog
     environment:
+      <<: *otel-env
       SERVER_PORT: "8082"
       DATABASE_URL: jdbc:postgresql://postgres:5432/otel_demo
       DATABASE_USER: otel
       DATABASE_PASSWORD: otel
       OTEL_SERVICE_NAME: catalog-service
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-      OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
-      OTEL_LOGS_EXPORTER: otlp
-      OTEL_METRICS_EXPORTER: otlp
-      OTEL_TRACES_EXPORTER: otlp
     ports:
       - "8082:8082"
     depends_on:
       postgres:
         condition: service_healthy
       otel-collector:
-        condition: service_started
+        condition: service_healthy
 
   orders:
     build: ./services/orders
     environment:
+      <<: *otel-env
       PORT: "8081"
       DATABASE_URL: postgresql://otel:otel@postgres:5432/otel_demo
       RABBITMQ_URL: amqp://otel:otel@rabbitmq:5672/
@@ -98,9 +102,6 @@ services:
       FLAGD_HOST: flagd
       FLAGD_PORT: "8013"
       OTEL_SERVICE_NAME: orders-service
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-      OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
       OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
     ports:
       - "8081:8081"
@@ -114,21 +115,19 @@ services:
       flagd:
         condition: service_started
       otel-collector:
-        condition: service_started
+        condition: service_healthy
 
   worker:
     build: ./services/worker
     restart: unless-stopped
     environment:
+      <<: *otel-env
       RABBITMQ_URL: amqp://otel:otel@rabbitmq:5672/
       DATABASE_URL: postgres://otel:otel@postgres:5432/otel_demo?sslmode=disable
       FLAGD_HOST: flagd
       FLAGD_PORT: "8013"
       HEALTH_PORT: "8083"
       OTEL_SERVICE_NAME: worker-service
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
-      OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
     ports:
       - "8083:8083"
     depends_on:
@@ -139,12 +138,13 @@ services:
       flagd:
         condition: service_started
       otel-collector:
-        condition: service_started
+        condition: service_healthy
 
   bff:
     build: ./services/bff
     restart: unless-stopped
     environment:
+      <<: *otel-env
       PORT: "3000"
       ORDERS_URL: http://orders:8081
       CATALOG_URL: http://catalog:8082
@@ -152,9 +152,6 @@ services:
       FLAGD_PORT: "8013"
       FLAGD_FILE: /etc/flagd/chaos.flagd.json
       OTEL_SERVICE_NAME: bff-service
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-      OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-demo,service.version=1.0.0
       OTEL_NODE_RESOURCE_DETECTORS: env,host,os
     ports:
       - "3000:3000"
@@ -168,7 +165,7 @@ services:
       flagd:
         condition: service_started
       otel-collector:
-        condition: service_started
+        condition: service_healthy
 
   frontend:
     build:
@@ -182,7 +179,6 @@ services:
       - bff
       - otel-collector
 
-  # Optional API journey generator (Locust). Does not produce browser RUM.
   locust:
     profiles: ["loadgen"]
     build: ./loadgen

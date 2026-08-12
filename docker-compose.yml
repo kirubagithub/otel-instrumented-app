@@ -67,11 +67,9 @@ services:
       - "${OTEL_COLLECTOR_GRPC_PORT:-4317}:4317"
       - "${OTEL_COLLECTOR_HTTP_PORT:-4318}:4318"
       - "13133:13133"
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:13133"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # Contrib image is minimal (no wget/curl). Process readiness is enough;
+    # apps retry OTLP export if the collector is still starting.
+    # Manual check: curl http://localhost:13133  (or your mapped host)
 
   catalog:
     build: ./services/catalog
@@ -88,7 +86,7 @@ services:
       postgres:
         condition: service_healthy
       otel-collector:
-        condition: service_healthy
+        condition: service_started
 
   orders:
     build: ./services/orders
@@ -115,7 +113,7 @@ services:
       flagd:
         condition: service_started
       otel-collector:
-        condition: service_healthy
+        condition: service_started
 
   worker:
     build: ./services/worker
@@ -138,7 +136,7 @@ services:
       flagd:
         condition: service_started
       otel-collector:
-        condition: service_healthy
+        condition: service_started
 
   bff:
     build: ./services/bff
@@ -165,7 +163,7 @@ services:
       flagd:
         condition: service_started
       otel-collector:
-        condition: service_healthy
+        condition: service_started
 
   frontend:
     build:

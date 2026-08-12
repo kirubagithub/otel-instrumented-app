@@ -38,6 +38,8 @@ OTEL_COLLECTOR_GRPC_PORT=14317
 
 Internal Docker ports stay `4317`/`4318`. Apps still talk to `http://otel-collector:4318` on the Compose network.
 
+The collector image has no `wget`/`curl`, so Compose does **not** use a Docker healthcheck for it (that was marking it `unhealthy` even when ready). Dependents use `service_started`; OTLP clients retry if needed.
+
 ## Browser RUM
 
 Uses same-origin `/otlp` (nginx → collector HTTP). Leave `VITE_OTEL_EXPORTER_OTLP_ENDPOINT=/otlp`.

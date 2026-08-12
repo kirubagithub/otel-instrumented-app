@@ -57,16 +57,22 @@ services:
       - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
     environment:
       OTEL_BACKEND_OTLP_HTTP_ENDPOINT: ${OTEL_BACKEND_OTLP_HTTP_ENDPOINT:-https://api.openobserve.ai/api/default}
-      OTEL_BACKEND_AUTHORIZATION: ${OTEL_BACKEND_AUTHORIZATION:-Basic REPLACE_ME}
-      OTEL_BACKEND_HEADER_ORGANIZATION: ${OTEL_BACKEND_HEADER_ORGANIZATION:-default}
-      OTEL_BACKEND_HEADER_STREAM: ${OTEL_BACKEND_HEADER_STREAM:-default}
+      # Empty by default so a second collector on the host is not sent "Basic REPLACE_ME".
+      OTEL_BACKEND_AUTHORIZATION: ${OTEL_BACKEND_AUTHORIZATION:-}
+      OTEL_BACKEND_HEADER_ORGANIZATION: ${OTEL_BACKEND_HEADER_ORGANIZATION:-}
+      OTEL_BACKEND_HEADER_STREAM: ${OTEL_BACKEND_HEADER_STREAM:-}
       OTEL_BACKEND_OTLP_GRPC_ENDPOINT: ${OTEL_BACKEND_OTLP_GRPC_ENDPOINT:-localhost:4317}
       OTEL_BACKEND_OTLP_GRPC_TLS_INSECURE: ${OTEL_BACKEND_OTLP_GRPC_TLS_INSECURE:-true}
     ports:
       # Host port → fixed internal 4317/4318 (simple mapping)
+      # If another stack already owns host :4318, set OTEL_COLLECTOR_HTTP_PORT=14318 in .env
       - "${OTEL_COLLECTOR_GRPC_PORT:-4317}:4317"
       - "${OTEL_COLLECTOR_HTTP_PORT:-4318}:4318"
       - "13133:13133"
+    # Linux/WSL: enable host.docker.internal so the collector can reach a backend
+    # OTLP endpoint published on the Docker host (e.g. another Compose stack on :4318).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Contrib image is minimal (no wget/curl). Process readiness is enough;
     # apps retry OTLP export if the collector is still starting.
     # Manual check: curl http://localhost:13133  (or your mapped host)

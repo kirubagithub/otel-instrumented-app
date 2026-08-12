@@ -68,9 +68,10 @@ exporters:
   # -------------------------------------------------------------------------
   otlphttp/backend:
     endpoint: ${env:OTEL_BACKEND_OTLP_HTTP_ENDPOINT}
+    # Headers are optional. Leave Authorization empty for a local/second collector.
+    # OpenObserve example: Authorization=Basic <token>, organization=…, stream-name=…
     headers:
       Authorization: ${env:OTEL_BACKEND_AUTHORIZATION}
-      # OpenObserve-specific (harmless empty for most other backends if unused)
       organization: ${env:OTEL_BACKEND_HEADER_ORGANIZATION}
       stream-name: ${env:OTEL_BACKEND_HEADER_STREAM}
     compression: gzip

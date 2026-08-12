@@ -25,7 +25,7 @@ Thanks for helping improve this observability demo stack.
 ## Dev loop
 
 ```bash
-cp .env.example .env   # set OTEL_BACKEND_* 
+cp .env.example .env   # set OTEL_BACKEND_* (OpenObserve auth, or host collector — see docs/telemetry.md) 
 docker compose up --build
 # optional load:
 docker compose --profile loadgen up --build locust

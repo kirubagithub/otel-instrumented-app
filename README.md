@@ -42,6 +42,6 @@ See `loadgen/README.md` and `docs/chaos-and-feature-flags.md`.
 
 ## Pluggable backends
 
-Apps → Collector only (shared OTLP/HTTP). Configure `OTEL_BACKEND_*` for OpenObserve or another product.
+Apps → Collector only (shared OTLP/HTTP). Configure `OTEL_BACKEND_*` for OpenObserve, another product, or a **second Collector on the host**.
 
-See [Telemetry wiring](docs/telemetry.md) for ingest vs backend env vars and port mapping.
+If another Compose stack already owns host `:4318`, remap this lab’s published ports and use `http://host.docker.internal:4318` — see [Telemetry wiring](docs/telemetry.md).

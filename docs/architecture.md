@@ -35,6 +35,10 @@ The worker previously could block on OpenFeature `SetProviderAndWait` / flaky th
 
 - Registers flagd **non-blocking**
 - Reconnects to RabbitMQ
-- Always writes `processing` → `processed` / `failed`
+- Writes `processing` early (before `chaos.queue_lag_ms` sleep) → `processed` / `failed`
 - Uses a local fallback ref if JSONPlaceholder is unreachable (span still records ERROR)
 - Exposes `:8083/health`
+
+If Locust shows orders “stuck” with **0% fails**, check that chaos flags are not sticky
+(`queue_lag_ms` / worker latency serialize the consumer). Current Locust resets a **full**
+flag snapshot and fails journeys that never reach `processed`/`failed`.

@@ -21,7 +21,7 @@ Feature gates live in `flags/chaos.flagd.json` and are served by **flagd**.
 | `chaos.queue_lag_ms` | int | Artificial consumer lag |
 | `chaos.slow_close_ms` | int | Delay before HTTP response returns |
 | `chaos.fail_open_meteo` | bool | Inject Open-Meteo failure |
-| `chaos.fail_stripe` | bool | Inject Stripe failure |
+| `chaos.fail_stripe` | bool | Inject Stripe failure (**works without `STRIPE_SECRET_KEY`**) |
 | `chaos.fail_jsonplaceholder` | bool | Inject worker third-party failure |
 | `chaos.fail_catalog` | bool | Break catalog hop |
 | `chaos.fail_publish` | bool | Skip RabbitMQ publish; mark order failed |

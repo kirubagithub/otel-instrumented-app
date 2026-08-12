@@ -19,7 +19,14 @@ docker compose --profile loadgen up --build locust
 Open http://localhost:8089 — start with e.g. 5 users, spawn rate 1, host `http://bff:3000` (pre-set).
 
 Env:
-- `CHAOS_INTERMITTENT=true` — ~25% of users apply a random chaos gate burst via OpenFeature
+- `CHAOS_INTERMITTENT=true` — ~25% of users apply a **full** chaos flag snapshot (defaults ⊕ burst) via OpenFeature so gates never stick from a prior burst
+- `ORDER_POLL_SECONDS=45` — fail the journey if an order stays non-terminal (`pending`/`processing`) this long
+
+Locust counts these as failures (visible in the report):
+- HTTP 4xx/5xx on checkout (including Gates like `fail_stripe` / `fail_catalog`)
+- Order still `pending`/`processing` after the poll window (worker/queue problem)
+
+Tip: leave Gates on **off** before a baseline run, or set `CHAOS_INTERMITTENT=false`.
 
 ## Run locally
 

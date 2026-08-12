@@ -270,6 +270,15 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 		attribute.Bool("chaos.fail_jsonplaceholder", chaos.FailJSONPlaceholder),
 	)
 
+	// Mark processing before artificial lag so the UI does not look "stuck pending"
+	// while chaos.queue_lag_ms is intentionally delaying the consumer.
+	if err := markOrder(ctx, pool, event.ID, "processing", "", ""); err != nil {
+		span.RecordError(err)
+		log.Printf("mark processing failed for %s: %v", event.ID, err)
+		_ = d.Nack(false, true)
+		return
+	}
+
 	if chaos.QueueLagMs > 0 {
 		_, lagSpan := tracer.Start(ctx, "chaos.queue_lag")
 		lagSpan.SetAttributes(
@@ -278,13 +287,6 @@ func processDelivery(ctx context.Context, tracer trace.Tracer, client *http.Clie
 		)
 		time.Sleep(time.Duration(chaos.QueueLagMs) * time.Millisecond)
 		lagSpan.End()
-	}
-
-	if err := markOrder(ctx, pool, event.ID, "processing", "", ""); err != nil {
-		span.RecordError(err)
-		log.Printf("mark processing failed for %s: %v", event.ID, err)
-		_ = d.Nack(false, true)
-		return
 	}
 
 	if chaos.WorkerLatencyMs > 0 {

@@ -51,7 +51,7 @@ def init_feature_flags() -> None:
     try:
         from openfeature.contrib.provider.flagd import FlagdProvider
 
-        # openfeature-sdk >=0.8.2 passes flag_key=; provider must match (>=0.2.x)
+        # openfeature-sdk >=0.8.2 passes flag_key=; provider must match (0.2.x; pin <=0.2.6 with OTel 1.29)
         api.set_provider(FlagdProvider(host=host, port=port, tls=False))
         _initialized = True
         logger.info("OpenFeature flagd provider ready at %s:%s", host, port)

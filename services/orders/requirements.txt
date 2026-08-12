@@ -12,6 +12,8 @@ opentelemetry-instrumentation-psycopg==0.50b0
 opentelemetry-instrumentation-logging==0.50b0
 opentelemetry-instrumentation-system-metrics==0.50b0
 stripe==11.4.1
-# SDK 0.8.1 + provider 0.1.5 are incompatible (flag_key= vs key= TypeError).
+# SDK >=0.8.2 passes flag_key=; provider must be >=0.2.x.
+# 0.2.7+ needs protobuf>=6.30, which conflicts with opentelemetry-proto 1.29 (protobuf<6).
+# 0.2.6 keeps flag_key= and protobuf>=5.26.1 (compatible with OTel 1.29).
 openfeature-sdk==0.8.4
-openfeature-provider-flagd==0.2.7
+openfeature-provider-flagd==0.2.6

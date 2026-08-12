@@ -181,6 +181,20 @@ async def fetch_weather(lat: float, lon: float, chaos: ChaosOptions) -> Optional
 async def create_stripe_intent(
     amount_cents: int, currency: str, order_id: str, chaos: ChaosOptions
 ) -> tuple[Optional[str], Optional[str]]:
+    # Always honor fail_stripe — even when no Stripe key is configured — so Gates /
+    # Locust demos produce a real 502 without requiring STRIPE_SECRET_KEY.
+    if chaos.fail_stripe:
+        with tracer.start_as_current_span("orders.call_stripe_payment_intent") as span:
+            span.set_attribute("peer.service", "stripe")
+            span.set_attribute("dependency.type", "third_party")
+            span.set_attribute("order.id", order_id)
+            span.set_attribute("payment.amount_cents", amount_cents)
+            span.set_attribute("payment.currency", currency)
+            span.set_attribute("chaos.fail_stripe", True)
+            span.set_attribute("stripe.mode", "chaos_injected")
+            span.set_status(Status(StatusCode.ERROR, "chaos fail_stripe"))
+            raise HTTPException(status_code=502, detail="chaos_stripe_failure")
+
     if not STRIPE_SECRET_KEY:
         return None, None
 
@@ -190,11 +204,6 @@ async def create_stripe_intent(
         span.set_attribute("order.id", order_id)
         span.set_attribute("payment.amount_cents", amount_cents)
         span.set_attribute("payment.currency", currency)
-
-        if chaos.fail_stripe:
-            span.set_attribute("chaos.fail_stripe", True)
-            span.set_status(Status(StatusCode.ERROR, "chaos fail_stripe"))
-            raise HTTPException(status_code=502, detail="chaos_stripe_failure")
 
         try:
             intent = stripe.PaymentIntent.create(
@@ -364,25 +373,35 @@ async def create_order(body: CreateOrderRequest):
             "chaos": chaos_payload,
         }
 
+        publish_error: Optional[str] = None
         if chaos.fail_publish:
             with tracer.start_as_current_span("orders.publish_order_created") as pub_span:
                 pub_span.set_attribute("chaos.fail_publish", True)
                 pub_span.set_status(Status(StatusCode.ERROR, "chaos fail_publish"))
+            publish_error = "chaos_publish_failure"
+        else:
+            try:
+                publish_order_created(payload)
+            except Exception as exc:
+                logger.exception("publish failed for %s", order_id)
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, "publish_failure"))
+                publish_error = f"publish_failure: {exc}"
+
+        if publish_error:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
                         UPDATE orders
                         SET status = 'failed',
-                            error_message = 'chaos_publish_failure',
+                            error_message = %s,
                             updated_at = NOW()
                         WHERE id = %s
                         """,
-                        (order_id,),
+                        (publish_error, order_id),
                     )
                 conn.commit()
-        else:
-            publish_order_created(payload)
 
         await apply_delay(chaos.slow_close_ms, "slow_close")
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -393,13 +412,13 @@ async def create_order(body: CreateOrderRequest):
             "id": order_id,
             "product_id": body.product_id,
             "quantity": body.quantity,
-            "status": "failed" if chaos.fail_publish else "pending",
+            "status": "failed" if publish_error else "pending",
             "amount_cents": amount_cents,
             "currency": currency,
             "weather_temp_c": weather_temp,
             "stripe_payment_intent_id": stripe_pi,
             "stripe_request_id": stripe_req,
-            "error_message": "chaos_publish_failure" if chaos.fail_publish else None,
+            "error_message": publish_error,
             "chaos": chaos_payload,
             "feature_flag_source": "openfeature/flagd",
             "peer_calls": {

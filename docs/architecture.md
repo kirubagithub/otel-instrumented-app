@@ -1,5 +1,7 @@
 # Architecture
 
+High-level stack. For **request flows, BFF explanation, and service-map guidance**, see [application-workflow.md](./application-workflow.md).
+
 ```
 Browser SPA (RUM)
   routes: / /login /catalog /checkout /orders /gates /account

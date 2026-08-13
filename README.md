@@ -35,6 +35,7 @@ See `loadgen/README.md` and `docs/chaos-and-feature-flags.md`.
 
 ## Docs
 
+- [Application workflow & service map](docs/application-workflow.md) — **start here** for flows, BFF, and observability grouping
 - [Architecture](docs/architecture.md)
 - [Contributing](CONTRIBUTING.md)
 - [Chaos / OpenFeature](docs/chaos-and-feature-flags.md)

@@ -21,6 +21,7 @@ Thanks for helping improve this observability demo stack.
 | `flags/` | OpenFeature flagd definitions |
 | `loadgen/` | Locust journeys |
 | `docs/` | Architecture + per-service docs |
+| `docs/application-workflow.md` | Flows, BFF, service map / grouping for observability |
 
 ## Dev loop
 

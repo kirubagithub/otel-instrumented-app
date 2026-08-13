@@ -1,7 +1,9 @@
 # BFF service (Node.js)
 
+**BFF = Backend For Frontend** — an API tailored for the browser SPA. See [Application workflow](../application-workflow.md#what-is-the-bff) for why it exists and how it fits the map.
+
 ## Role
-API gateway between the browser and internal services. Owns demo session + flag admin writes.
+API gateway between the browser and internal services. Owns demo session + flag admin writes. The frontend never calls orders or catalog directly.
 
 ## Endpoints
 | Method | Path | Description |
